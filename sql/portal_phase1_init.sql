@@ -1,15 +1,30 @@
 -- Portal Phase 1: menu + permission bootstrap for RuoYi-Vue3 frontend.
 -- Run after base schema/data script (e.g. ry_20250522.sql).
 
--- 1) Hide built-in demo/tool modules.
-UPDATE sys_menu SET visible = '1', status = '1' WHERE menu_id IN (2, 3, 4);
-UPDATE sys_menu SET visible = '1', status = '1' WHERE parent_id IN (2, 3, 4);
-UPDATE sys_menu
-SET visible = '1', status = '1'
-WHERE parent_id IN (
+-- 1) Delete built-in "系统工具" menu tree (parent id usually = 3, path = 'tool').
+WITH RECURSIVE tool_tree AS (
     SELECT menu_id
-    FROM (SELECT menu_id FROM sys_menu WHERE parent_id IN (2, 3, 4)) t
-);
+    FROM sys_menu
+    WHERE menu_id = 3 OR path = 'tool'
+    UNION ALL
+    SELECT m.menu_id
+    FROM sys_menu m
+    INNER JOIN tool_tree t ON m.parent_id = t.menu_id
+)
+DELETE FROM sys_role_menu
+WHERE menu_id IN (SELECT menu_id FROM tool_tree);
+
+WITH RECURSIVE tool_tree AS (
+    SELECT menu_id
+    FROM sys_menu
+    WHERE menu_id = 3 OR path = 'tool'
+    UNION ALL
+    SELECT m.menu_id
+    FROM sys_menu m
+    INNER JOIN tool_tree t ON m.parent_id = t.menu_id
+)
+DELETE FROM sys_menu
+WHERE menu_id IN (SELECT menu_id FROM tool_tree);
 
 -- 2) Keep role-menu clean: remove disabled menu assignments from role `common` (role_id=2).
 DELETE rm
@@ -70,3 +85,41 @@ INSERT INTO sys_menu
     (menu_id, menu_name, parent_id, order_num, path, component, `query`, route_name, is_frame, is_cache, menu_type, visible, status, perms, icon, create_by, create_time, update_by, update_time, remark)
 SELECT 2013, '公版图管理', 2005, 1, '', '', '', '', 1, 0, 'F', '0', '0', 'commander:map', '#', 'admin', NOW(), '', NULL, 'Commander地图权限点'
 WHERE NOT EXISTS (SELECT 1 FROM sys_menu WHERE menu_id = 2013);
+
+-- 6) Mock permission points for Commander fake buttons (frontend-only for permission testing).
+INSERT INTO sys_menu
+    (menu_id, menu_name, parent_id, order_num, path, component, `query`, route_name, is_frame, is_cache, menu_type, visible, status, perms, icon, create_by, create_time, update_by, update_time, remark)
+SELECT 2014, '模拟启动任务', 2004, 2, '', '', '', '', 1, 0, 'F', '0', '0', 'commander:start:mockRun', '#', 'admin', NOW(), '', NULL, '任务启动页模拟按钮权限'
+WHERE NOT EXISTS (SELECT 1 FROM sys_menu WHERE menu_id = 2014);
+
+INSERT INTO sys_menu
+    (menu_id, menu_name, parent_id, order_num, path, component, `query`, route_name, is_frame, is_cache, menu_type, visible, status, perms, icon, create_by, create_time, update_by, update_time, remark)
+SELECT 2015, '模拟停止任务', 2004, 3, '', '', '', '', 1, 0, 'F', '0', '0', 'commander:start:mockStop', '#', 'admin', NOW(), '', NULL, '任务启动页模拟按钮权限'
+WHERE NOT EXISTS (SELECT 1 FROM sys_menu WHERE menu_id = 2015);
+
+INSERT INTO sys_menu
+    (menu_id, menu_name, parent_id, order_num, path, component, `query`, route_name, is_frame, is_cache, menu_type, visible, status, perms, icon, create_by, create_time, update_by, update_time, remark)
+SELECT 2016, '模拟发布公版图', 2005, 2, '', '', '', '', 1, 0, 'F', '0', '0', 'commander:map:mockPublish', '#', 'admin', NOW(), '', NULL, '公版图页模拟按钮权限'
+WHERE NOT EXISTS (SELECT 1 FROM sys_menu WHERE menu_id = 2016);
+
+INSERT INTO sys_menu
+    (menu_id, menu_name, parent_id, order_num, path, component, `query`, route_name, is_frame, is_cache, menu_type, visible, status, perms, icon, create_by, create_time, update_by, update_time, remark)
+SELECT 2017, '模拟作废版本', 2005, 3, '', '', '', '', 1, 0, 'F', '0', '0', 'commander:map:mockDisable', '#', 'admin', NOW(), '', NULL, '公版图页模拟按钮权限'
+WHERE NOT EXISTS (SELECT 1 FROM sys_menu WHERE menu_id = 2017);
+
+-- 7) Grant new mock permissions to admin role by default.
+INSERT INTO sys_role_menu(role_id, menu_id)
+SELECT 1, 2014 FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM sys_role_menu WHERE role_id = 1 AND menu_id = 2014);
+
+INSERT INTO sys_role_menu(role_id, menu_id)
+SELECT 1, 2015 FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM sys_role_menu WHERE role_id = 1 AND menu_id = 2015);
+
+INSERT INTO sys_role_menu(role_id, menu_id)
+SELECT 1, 2016 FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM sys_role_menu WHERE role_id = 1 AND menu_id = 2016);
+
+INSERT INTO sys_role_menu(role_id, menu_id)
+SELECT 1, 2017 FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM sys_role_menu WHERE role_id = 1 AND menu_id = 2017);
