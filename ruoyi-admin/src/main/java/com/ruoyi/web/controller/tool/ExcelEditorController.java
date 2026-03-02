@@ -56,6 +56,7 @@ import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.FillPatternType;
 import org.apache.poi.ss.usermodel.Font;
 import org.apache.poi.ss.usermodel.FormulaEvaluator;
+import org.apache.poi.ss.usermodel.Name;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
@@ -100,6 +101,16 @@ public class ExcelEditorController
     private static final String CURRENT_FILE_MARKER = ".current";
 
     private static final String[] ALLOWED_EXTENSIONS = { "xls", "xlsx" };
+
+    /**
+     * Excel single-cell text hard limit (characters), shared by xls/xlsx.
+     */
+    private static final int MAX_CELL_TEXT_LENGTH = 32767;
+
+    /**
+     * Defensive upper bound to avoid pathological payloads.
+     */
+    private static final int MAX_PATCH_CHANGES = 100000;
 
     private static final DateTimeFormatter[] DATE_TIME_FORMATTERS = {
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
@@ -224,6 +235,10 @@ public class ExcelEditorController
 
             applyWorkbookChanges(targetFile.get(), request.getChanges(), request.getMergeRegions());
             return AjaxResult.success("Excel saved and original formatting was preserved", buildUploadResponse(targetFile.get()));
+        }
+        catch (IllegalArgumentException e)
+        {
+            return AjaxResult.error(e.getMessage());
         }
         catch (Exception e)
         {
@@ -460,15 +475,22 @@ public class ExcelEditorController
     private void applyWorkbookChanges(Path workbookPath, List<CellPatch> changes, List<MergeRegionPatch> mergeRegions)
             throws Exception
     {
+        if (changes != null && changes.size() > MAX_PATCH_CHANGES)
+        {
+            throw new IllegalArgumentException("Too many changed cells in one save request");
+        }
+
         Path tempFile = null;
         try (InputStream inputStream = Files.newInputStream(workbookPath);
                 Workbook workbook = WorkbookFactory.create(inputStream))
         {
+            DataFormatter formatter = new DataFormatter(Locale.getDefault());
+            FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
             if (changes != null)
             {
                 for (CellPatch change : changes)
                 {
-                    applySingleChange(workbook, change);
+                    applySingleChange(workbook, change, formatter, evaluator);
                 }
             }
 
@@ -606,7 +628,8 @@ public class ExcelEditorController
                 + region.getLastColumn();
     }
 
-    private void applySingleChange(Workbook workbook, CellPatch change)
+    private void applySingleChange(Workbook workbook, CellPatch change, DataFormatter formatter,
+            FormulaEvaluator evaluator)
     {
         if (change == null || StringUtils.isEmpty(change.getSheetName()) || change.getRowIndex() == null
                 || change.getColIndex() == null)
@@ -620,19 +643,63 @@ public class ExcelEditorController
             return;
         }
 
-        Row row = sheet.getRow(change.getRowIndex());
-        if (row == null)
+        int rowIndex = change.getRowIndex().intValue();
+        int columnIndex = change.getColIndex().intValue();
+        if (rowIndex < 0 || columnIndex < 0)
         {
-            row = sheet.createRow(change.getRowIndex());
+            throw new IllegalArgumentException("Cell index cannot be negative");
         }
 
-        Cell cell = row.getCell(change.getColIndex(), Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+        int maxRowIndex = resolveLastActiveRowIndex(sheet);
+        int maxColumnCount = resolveMaxColumnCount(sheet);
+        int maxColumnIndex = Math.max(maxColumnCount - 1, 0);
+        if (rowIndex > maxRowIndex || columnIndex > maxColumnIndex)
+        {
+            throw new IllegalArgumentException("Cell out of sheet bounds: " + sheet.getSheetName() + "!"
+                    + formatCellAddress(rowIndex, columnIndex));
+        }
+
+        Row row = sheet.getRow(rowIndex);
+        if (row == null)
+        {
+            row = sheet.createRow(rowIndex);
+        }
+
+        ValidationRule validationRule = resolveListValidationRuleForCell(workbook, sheet, rowIndex, columnIndex, formatter,
+                evaluator);
+        if (validationRule != null && !validationRule.getOptions().isEmpty())
+        {
+            String rawValue = change.getValue() == null ? "" : change.getValue();
+            String normalizedValue = rawValue.trim();
+            if (StringUtils.isEmpty(normalizedValue))
+            {
+                if (!validationRule.isAllowBlank())
+                {
+                    throw new IllegalArgumentException(
+                            "Cell " + sheet.getSheetName() + "!" + formatCellAddress(rowIndex, columnIndex)
+                                    + " does not allow blank value");
+                }
+            }
+            else if (!validationRule.getOptions().contains(normalizedValue))
+            {
+                throw new IllegalArgumentException(
+                        "Cell " + sheet.getSheetName() + "!" + formatCellAddress(rowIndex, columnIndex)
+                                + " must use one of the dropdown options");
+            }
+        }
+
+        Cell cell = row.getCell(columnIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
         applyCellValue(cell, change.getValue());
     }
 
     private void applyCellValue(Cell cell, String inputValue)
     {
         String safeValue = inputValue == null ? "" : inputValue;
+        if (safeValue.length() > MAX_CELL_TEXT_LENGTH)
+        {
+            throw new IllegalArgumentException("Cell text exceeds Excel limit of " + MAX_CELL_TEXT_LENGTH
+                    + " characters");
+        }
         if (safeValue.startsWith("=") && safeValue.length() > 1)
         {
             cell.setCellFormula(safeValue.substring(1));
@@ -844,6 +911,49 @@ public class ExcelEditorController
         return items;
     }
 
+    private ValidationRule resolveListValidationRuleForCell(Workbook workbook, Sheet sheet, int rowIndex, int columnIndex,
+            DataFormatter formatter, FormulaEvaluator evaluator)
+    {
+        List<? extends DataValidation> validations = sheet.getDataValidations();
+        for (DataValidation validation : validations)
+        {
+            DataValidationConstraint constraint = validation.getValidationConstraint();
+            if (constraint == null || constraint.getValidationType() != DataValidationConstraint.ValidationType.LIST)
+            {
+                continue;
+            }
+
+            CellRangeAddressList regions = validation.getRegions();
+            if (regions == null || regions.countRanges() == 0)
+            {
+                continue;
+            }
+
+            boolean inRegion = false;
+            for (CellRangeAddress region : regions.getCellRangeAddresses())
+            {
+                if (rowIndex >= region.getFirstRow() && rowIndex <= region.getLastRow() && columnIndex >= region.getFirstColumn()
+                        && columnIndex <= region.getLastColumn())
+                {
+                    inRegion = true;
+                    break;
+                }
+            }
+            if (!inRegion)
+            {
+                continue;
+            }
+
+            List<String> options = resolveValidationOptions(workbook, sheet, constraint, formatter, evaluator);
+            if (options.isEmpty())
+            {
+                continue;
+            }
+            return new ValidationRule(options, validation.getEmptyCellAllowed());
+        }
+        return null;
+    }
+
     private List<String> resolveValidationOptions(Workbook workbook, Sheet sheet, DataValidationConstraint constraint,
             DataFormatter formatter, FormulaEvaluator evaluator)
     {
@@ -870,7 +980,68 @@ public class ExcelEditorController
             return normalizeValidationOptions(csvText.split(","));
         }
 
+        List<String> namedRangeOptions = resolveValidationOptionsFromNamedRange(workbook, sheet, normalizedFormula,
+                formatter, evaluator);
+        if (!namedRangeOptions.isEmpty())
+        {
+            return namedRangeOptions;
+        }
+
         return resolveValidationOptionsFromRange(workbook, sheet, normalizedFormula, formatter, evaluator);
+    }
+
+    private List<String> resolveValidationOptionsFromNamedRange(Workbook workbook, Sheet currentSheet, String expression,
+            DataFormatter formatter, FormulaEvaluator evaluator)
+    {
+        String nameKey = expression == null ? "" : expression.trim();
+        if (StringUtils.isEmpty(nameKey))
+        {
+            return new ArrayList<String>();
+        }
+        if (nameKey.startsWith("="))
+        {
+            nameKey = nameKey.substring(1).trim();
+        }
+        if (StringUtils.isEmpty(nameKey) || nameKey.contains("!") || nameKey.contains("("))
+        {
+            return new ArrayList<String>();
+        }
+
+        int currentSheetIndex = workbook.getSheetIndex(currentSheet);
+        Name matched = null;
+        for (Name name : workbook.getAllNames())
+        {
+            if (name == null || StringUtils.isEmpty(name.getNameName()))
+            {
+                continue;
+            }
+            if (!name.getNameName().equalsIgnoreCase(nameKey))
+            {
+                continue;
+            }
+            int sheetIndex = name.getSheetIndex();
+            if (sheetIndex == currentSheetIndex)
+            {
+                matched = name;
+                break;
+            }
+            if (matched == null && sheetIndex == -1)
+            {
+                matched = name;
+            }
+        }
+
+        if (matched == null || StringUtils.isEmpty(matched.getRefersToFormula()))
+        {
+            return new ArrayList<String>();
+        }
+
+        String referred = matched.getRefersToFormula().trim();
+        if (StringUtils.isEmpty(referred) || referred.equalsIgnoreCase(nameKey))
+        {
+            return new ArrayList<String>();
+        }
+        return resolveValidationOptionsFromRange(workbook, currentSheet, referred, formatter, evaluator);
     }
 
     private List<String> normalizeValidationOptions(String[] values)
@@ -1490,6 +1661,24 @@ public class ExcelEditorController
         return rowIndex + ":" + columnIndex;
     }
 
+    private String formatCellAddress(int rowIndex, int columnIndex)
+    {
+        return toColumnLabel(columnIndex) + (rowIndex + 1);
+    }
+
+    private String toColumnLabel(int columnIndex)
+    {
+        int value = Math.max(columnIndex, 0) + 1;
+        StringBuilder builder = new StringBuilder();
+        while (value > 0)
+        {
+            int remainder = (value - 1) % 26;
+            builder.insert(0, (char) ('A' + remainder));
+            value = (value - 1) / 26;
+        }
+        return builder.length() > 0 ? builder.toString() : "A";
+    }
+
     private Path storeUploadedWorkbook(MultipartFile file) throws IOException
     {
         validateExcelFile(file);
@@ -1708,6 +1897,28 @@ public class ExcelEditorController
             FileUtils.setAttachmentResponseHeader(response, file.getFileName().toString());
             Files.copy(file, outputStream);
             outputStream.flush();
+        }
+    }
+
+    private static class ValidationRule
+    {
+        private final List<String> options;
+        private final boolean allowBlank;
+
+        ValidationRule(List<String> options, boolean allowBlank)
+        {
+            this.options = options == null ? new ArrayList<String>() : options;
+            this.allowBlank = allowBlank;
+        }
+
+        List<String> getOptions()
+        {
+            return options;
+        }
+
+        boolean isAllowBlank()
+        {
+            return allowBlank;
         }
     }
 
