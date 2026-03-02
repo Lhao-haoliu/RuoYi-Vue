@@ -3,6 +3,8 @@ package com.ruoyi.web.controller.tool;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.ByteArrayInputStream;
+import java.awt.image.BufferedImage;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -20,25 +22,36 @@ import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Base64;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javax.imageio.ImageIO;
 import javax.servlet.http.HttpServletResponse;
+import org.apache.poi.ooxml.POIXMLDocumentPart;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.poi.hssf.usermodel.HSSFFont;
 import org.apache.poi.hssf.usermodel.HSSFPalette;
+import org.apache.poi.hssf.usermodel.HSSFCellStyle;
 import org.apache.poi.hssf.usermodel.HSSFWorkbook;
 import org.apache.poi.hssf.util.HSSFColor;
+import org.apache.poi.ss.usermodel.BorderStyle;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellStyle;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.Color;
 import org.apache.poi.ss.usermodel.DataFormatter;
+import org.apache.poi.ss.usermodel.DataValidation;
+import org.apache.poi.ss.usermodel.DataValidationConstraint;
 import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.FillPatternType;
 import org.apache.poi.ss.usermodel.Font;
@@ -48,8 +61,18 @@ import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.usermodel.WorkbookFactory;
 import org.apache.poi.ss.util.CellRangeAddress;
+import org.apache.poi.ss.util.CellRangeAddressList;
+import org.apache.poi.ss.util.CellReference;
+import org.apache.poi.ss.util.PaneInformation;
 import org.apache.poi.xssf.usermodel.XSSFColor;
+import org.apache.poi.xssf.usermodel.XSSFCellStyle;
+import org.apache.poi.xssf.usermodel.XSSFClientAnchor;
+import org.apache.poi.xssf.usermodel.XSSFDrawing;
 import org.apache.poi.xssf.usermodel.XSSFFont;
+import org.apache.poi.xssf.usermodel.XSSFPicture;
+import org.apache.poi.xssf.usermodel.XSSFPictureData;
+import org.apache.poi.xssf.usermodel.XSSFShape;
+import org.apache.poi.xssf.usermodel.XSSFSheet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -90,6 +113,9 @@ public class ExcelEditorController
             DateTimeFormatter.ofPattern("yyyy/MM/dd"),
             DateTimeFormatter.ofPattern("yyyy.MM.dd")
     };
+
+    private static final Pattern BACKGROUND_PICTURE_RELATION_PATTERN = Pattern
+            .compile("<(?:\\w+:)?picture[^>]*\\br:id\\s*=\\s*\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
 
     @GetMapping("/info")
     public AjaxResult info()
@@ -196,7 +222,7 @@ public class ExcelEditorController
                 return AjaxResult.error("The selected Excel file does not exist");
             }
 
-            applyWorkbookChanges(targetFile.get(), request.getChanges());
+            applyWorkbookChanges(targetFile.get(), request.getChanges(), request.getMergeRegions());
             return AjaxResult.success("Excel saved and original formatting was preserved", buildUploadResponse(targetFile.get()));
         }
         catch (Exception e)
@@ -243,6 +269,21 @@ public class ExcelEditorController
     {
         Map<String, Object> data = new LinkedHashMap<String, Object>();
         data.put("name", sheet.getSheetName());
+        Map<String, Object> freezePane = buildFreezePaneView(sheet);
+        if (!freezePane.isEmpty())
+        {
+            data.put("freezePane", freezePane);
+        }
+        List<Map<String, Object>> validations = buildValidationView(workbook, sheet, formatter, evaluator);
+        if (!validations.isEmpty())
+        {
+            data.put("validations", validations);
+        }
+        List<Map<String, Object>> images = buildSheetImageView(workbook, sheet);
+        if (!images.isEmpty())
+        {
+            data.put("images", images);
+        }
 
         int lastRowIndex = resolveLastActiveRowIndex(sheet);
         int maxColumnCount = resolveMaxColumnCount(sheet);
@@ -284,7 +325,7 @@ public class ExcelEditorController
                 CellRangeAddress mergedRegion = mergedStartMap.get(buildCellKey(rowIndex, columnIndex));
                 int rowSpan = mergedRegion == null ? 1 : mergedRegion.getLastRow() - mergedRegion.getFirstRow() + 1;
                 int colSpan = mergedRegion == null ? 1 : mergedRegion.getLastColumn() - mergedRegion.getFirstColumn() + 1;
-                Cell cell = row == null ? null : row.getCell(columnIndex, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+                Cell cell = row == null ? null : row.getCell(columnIndex, Row.MissingCellPolicy.RETURN_NULL_AND_BLANK);
                 cells.add(buildCellView(workbook, sheet, row, cell, rowIndex, columnIndex, rowSpan, colSpan, formatter,
                         evaluator));
             }
@@ -312,14 +353,14 @@ public class ExcelEditorController
         data.put("formula", isFormulaCell(cell));
         data.put("widthPx", resolveWidthPx(sheet, columnIndex, colSpan));
         data.put("heightPx", resolveHeightPx(sheet, rowIndex, rowSpan));
-        data.put("style", buildStyleView(workbook, row, cell));
+        data.put("style", buildStyleView(workbook, sheet, row, cell, columnIndex));
         return data;
     }
 
-    private Map<String, Object> buildStyleView(Workbook workbook, Row row, Cell cell)
+    private Map<String, Object> buildStyleView(Workbook workbook, Sheet sheet, Row row, Cell cell, int columnIndex)
     {
         Map<String, Object> style = new LinkedHashMap<String, Object>();
-        CellStyle cellStyle = resolveCellStyle(row, cell);
+        CellStyle cellStyle = resolveCellStyle(sheet, row, cell, columnIndex);
         if (cellStyle == null)
         {
             return style;
@@ -407,10 +448,17 @@ public class ExcelEditorController
         {
             style.put("whiteSpace", "pre-wrap");
         }
+        else
+        {
+            style.put("whiteSpace", "nowrap");
+        }
+
+        style.putAll(buildBorderStyle(workbook, cellStyle));
         return style;
     }
 
-    private void applyWorkbookChanges(Path workbookPath, List<CellPatch> changes) throws Exception
+    private void applyWorkbookChanges(Path workbookPath, List<CellPatch> changes, List<MergeRegionPatch> mergeRegions)
+            throws Exception
     {
         Path tempFile = null;
         try (InputStream inputStream = Files.newInputStream(workbookPath);
@@ -422,6 +470,11 @@ public class ExcelEditorController
                 {
                     applySingleChange(workbook, change);
                 }
+            }
+
+            if (mergeRegions != null)
+            {
+                applyWorkbookMergeLayout(workbook, mergeRegions);
             }
 
             workbook.setForceFormulaRecalculation(true);
@@ -443,6 +496,114 @@ public class ExcelEditorController
 
         Files.move(tempFile, workbookPath, StandardCopyOption.REPLACE_EXISTING);
         writeCurrentMarker(workbookPath.getFileName().toString());
+    }
+
+    private void applyWorkbookMergeLayout(Workbook workbook, List<MergeRegionPatch> mergeRegions)
+    {
+        Map<String, List<CellRangeAddress>> nextRegionsBySheet = new HashMap<String, List<CellRangeAddress>>();
+        Set<String> dedupeKeys = new HashSet<String>();
+
+        for (MergeRegionPatch mergeRegion : mergeRegions)
+        {
+            CellRangeAddress region = toCellRangeAddress(mergeRegion);
+            if (region == null)
+            {
+                continue;
+            }
+
+            Sheet sheet = workbook.getSheet(mergeRegion.getSheetName());
+            if (sheet == null)
+            {
+                continue;
+            }
+
+            String dedupeKey = sheet.getSheetName() + ":" + buildMergeRegionKey(region);
+            if (!dedupeKeys.add(dedupeKey))
+            {
+                continue;
+            }
+
+            nextRegionsBySheet.computeIfAbsent(sheet.getSheetName(), key -> new ArrayList<CellRangeAddress>()).add(region);
+        }
+
+        for (int sheetIndex = 0; sheetIndex < workbook.getNumberOfSheets(); sheetIndex++)
+        {
+            Sheet sheet = workbook.getSheetAt(sheetIndex);
+            List<CellRangeAddress> nextRegions = nextRegionsBySheet.getOrDefault(sheet.getSheetName(),
+                    new ArrayList<CellRangeAddress>());
+            nextRegions.sort(Comparator.comparingInt(CellRangeAddress::getFirstRow)
+                    .thenComparingInt(CellRangeAddress::getFirstColumn).thenComparingInt(CellRangeAddress::getLastRow)
+                    .thenComparingInt(CellRangeAddress::getLastColumn));
+
+            Set<String> originalRegionKeys = new HashSet<String>();
+            for (int mergeIndex = 0; mergeIndex < sheet.getNumMergedRegions(); mergeIndex++)
+            {
+                originalRegionKeys.add(buildMergeRegionKey(sheet.getMergedRegion(mergeIndex)));
+            }
+
+            clearMergedRegions(sheet);
+
+            for (CellRangeAddress region : nextRegions)
+            {
+                if (!originalRegionKeys.contains(buildMergeRegionKey(region)))
+                {
+                    clearMergedCoveredCells(sheet, region);
+                }
+                sheet.addMergedRegion(region);
+            }
+        }
+    }
+
+    private CellRangeAddress toCellRangeAddress(MergeRegionPatch mergeRegion)
+    {
+        if (mergeRegion == null || StringUtils.isEmpty(mergeRegion.getSheetName()) || mergeRegion.getFirstRow() == null
+                || mergeRegion.getLastRow() == null || mergeRegion.getFirstColumn() == null
+                || mergeRegion.getLastColumn() == null)
+        {
+            return null;
+        }
+
+        int firstRow = Math.max(mergeRegion.getFirstRow().intValue(), 0);
+        int lastRow = Math.max(mergeRegion.getLastRow().intValue(), firstRow);
+        int firstColumn = Math.max(mergeRegion.getFirstColumn().intValue(), 0);
+        int lastColumn = Math.max(mergeRegion.getLastColumn().intValue(), firstColumn);
+        return new CellRangeAddress(firstRow, lastRow, firstColumn, lastColumn);
+    }
+
+    private void clearMergedRegions(Sheet sheet)
+    {
+        for (int mergeIndex = sheet.getNumMergedRegions() - 1; mergeIndex >= 0; mergeIndex--)
+        {
+            sheet.removeMergedRegion(mergeIndex);
+        }
+    }
+
+    private void clearMergedCoveredCells(Sheet sheet, CellRangeAddress region)
+    {
+        for (int rowIndex = region.getFirstRow(); rowIndex <= region.getLastRow(); rowIndex++)
+        {
+            for (int columnIndex = region.getFirstColumn(); columnIndex <= region.getLastColumn(); columnIndex++)
+            {
+                if (rowIndex == region.getFirstRow() && columnIndex == region.getFirstColumn())
+                {
+                    continue;
+                }
+
+                Row row = sheet.getRow(rowIndex);
+                if (row == null)
+                {
+                    row = sheet.createRow(rowIndex);
+                }
+                Cell cell = row.getCell(columnIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                cell.setBlank();
+            }
+        }
+    }
+
+    private String buildMergeRegionKey(CellRangeAddress region)
+    {
+        return region.getFirstRow() + ":" + region.getLastRow() + ":" + region.getFirstColumn() + ":"
+                + region.getLastColumn();
     }
 
     private void applySingleChange(Workbook workbook, CellPatch change)
@@ -602,7 +763,7 @@ public class ExcelEditorController
         return cell != null && cell.getCellType() == CellType.FORMULA;
     }
 
-    private CellStyle resolveCellStyle(Row row, Cell cell)
+    private CellStyle resolveCellStyle(Sheet sheet, Row row, Cell cell, int columnIndex)
     {
         if (cell != null)
         {
@@ -610,9 +771,600 @@ public class ExcelEditorController
         }
         if (row != null && row.isFormatted())
         {
-            return row.getRowStyle();
+            CellStyle rowStyle = row.getRowStyle();
+            if (rowStyle != null)
+            {
+                return rowStyle;
+            }
+        }
+        if (sheet != null)
+        {
+            CellStyle columnStyle = sheet.getColumnStyle(columnIndex);
+            if (columnStyle != null)
+            {
+                return columnStyle;
+            }
         }
         return null;
+    }
+
+    private Map<String, Object> buildFreezePaneView(Sheet sheet)
+    {
+        Map<String, Object> data = new LinkedHashMap<String, Object>();
+        PaneInformation pane = sheet.getPaneInformation();
+        if (pane == null || !pane.isFreezePane())
+        {
+            return data;
+        }
+
+        data.put("xSplit", pane.getVerticalSplitPosition());
+        data.put("ySplit", pane.getHorizontalSplitPosition());
+        data.put("leftColumn", pane.getVerticalSplitLeftColumn());
+        data.put("topRow", pane.getHorizontalSplitTopRow());
+        return data;
+    }
+
+    private List<Map<String, Object>> buildValidationView(Workbook workbook, Sheet sheet, DataFormatter formatter,
+            FormulaEvaluator evaluator)
+    {
+        List<Map<String, Object>> items = new ArrayList<Map<String, Object>>();
+        List<? extends DataValidation> validations = sheet.getDataValidations();
+        for (DataValidation validation : validations)
+        {
+            DataValidationConstraint constraint = validation.getValidationConstraint();
+            if (constraint == null || constraint.getValidationType() != DataValidationConstraint.ValidationType.LIST)
+            {
+                continue;
+            }
+
+            List<String> options = resolveValidationOptions(workbook, sheet, constraint, formatter, evaluator);
+            if (options.isEmpty())
+            {
+                continue;
+            }
+
+            CellRangeAddressList regions = validation.getRegions();
+            if (regions == null || regions.countRanges() == 0)
+            {
+                continue;
+            }
+
+            for (CellRangeAddress region : regions.getCellRangeAddresses())
+            {
+                Map<String, Object> item = new LinkedHashMap<String, Object>();
+                item.put("firstRow", region.getFirstRow());
+                item.put("lastRow", region.getLastRow());
+                item.put("firstColumn", region.getFirstColumn());
+                item.put("lastColumn", region.getLastColumn());
+                item.put("options", options);
+                item.put("allowBlank", validation.getEmptyCellAllowed());
+                items.add(item);
+            }
+        }
+        return items;
+    }
+
+    private List<String> resolveValidationOptions(Workbook workbook, Sheet sheet, DataValidationConstraint constraint,
+            DataFormatter formatter, FormulaEvaluator evaluator)
+    {
+        String[] explicitValues = constraint.getExplicitListValues();
+        if (explicitValues != null && explicitValues.length > 0)
+        {
+            return normalizeValidationOptions(explicitValues);
+        }
+
+        String formula = constraint.getFormula1();
+        if (StringUtils.isEmpty(formula))
+        {
+            return new ArrayList<String>();
+        }
+
+        String normalizedFormula = formula.trim();
+        if (normalizedFormula.startsWith("\"") && normalizedFormula.endsWith("\"") && normalizedFormula.length() >= 2)
+        {
+            String csvText = normalizedFormula.substring(1, normalizedFormula.length() - 1);
+            if (StringUtils.isEmpty(csvText))
+            {
+                return new ArrayList<String>();
+            }
+            return normalizeValidationOptions(csvText.split(","));
+        }
+
+        return resolveValidationOptionsFromRange(workbook, sheet, normalizedFormula, formatter, evaluator);
+    }
+
+    private List<String> normalizeValidationOptions(String[] values)
+    {
+        Set<String> dedupe = new LinkedHashSet<String>();
+        if (values == null)
+        {
+            return new ArrayList<String>();
+        }
+        for (String value : values)
+        {
+            String normalized = value == null ? "" : value.trim();
+            if (StringUtils.isNotEmpty(normalized))
+            {
+                dedupe.add(normalized);
+            }
+        }
+        return new ArrayList<String>(dedupe);
+    }
+
+    private List<String> resolveValidationOptionsFromRange(Workbook workbook, Sheet currentSheet, String formula,
+            DataFormatter formatter, FormulaEvaluator evaluator)
+    {
+        String expression = formula == null ? "" : formula.trim();
+        if (StringUtils.isEmpty(expression))
+        {
+            return new ArrayList<String>();
+        }
+
+        if (expression.startsWith("="))
+        {
+            expression = expression.substring(1).trim();
+        }
+
+        String sourceSheetName = currentSheet.getSheetName();
+        String rangeRef = expression;
+        int delimiter = expression.lastIndexOf('!');
+        if (delimiter >= 0)
+        {
+            sourceSheetName = normalizeSheetName(expression.substring(0, delimiter));
+            rangeRef = expression.substring(delimiter + 1);
+        }
+
+        Sheet sourceSheet = workbook.getSheet(sourceSheetName);
+        if (sourceSheet == null || StringUtils.isEmpty(rangeRef))
+        {
+            return new ArrayList<String>();
+        }
+
+        String normalizedRangeRef = rangeRef.replace("$", "");
+        String[] refs = normalizedRangeRef.split(":");
+        if (refs.length == 0 || refs.length > 2)
+        {
+            return new ArrayList<String>();
+        }
+
+        CellReference firstRef;
+        CellReference lastRef;
+        try
+        {
+            firstRef = new CellReference(refs[0]);
+            lastRef = refs.length == 2 ? new CellReference(refs[1]) : firstRef;
+        }
+        catch (Exception e)
+        {
+            return new ArrayList<String>();
+        }
+
+        int firstRow = Math.max(Math.min(firstRef.getRow(), lastRef.getRow()), 0);
+        int lastRow = Math.max(firstRef.getRow(), lastRef.getRow());
+        int firstCol = Math.max(Math.min(firstRef.getCol(), lastRef.getCol()), 0);
+        int lastCol = Math.max(firstRef.getCol(), lastRef.getCol());
+
+        long totalCells = (long) (lastRow - firstRow + 1) * (long) (lastCol - firstCol + 1);
+        if (totalCells > 5000L)
+        {
+            return new ArrayList<String>();
+        }
+
+        Set<String> dedupe = new LinkedHashSet<String>();
+        for (int rowIndex = firstRow; rowIndex <= lastRow; rowIndex++)
+        {
+            Row row = sourceSheet.getRow(rowIndex);
+            if (row == null)
+            {
+                continue;
+            }
+            for (int columnIndex = firstCol; columnIndex <= lastCol; columnIndex++)
+            {
+                Cell cell = row.getCell(columnIndex, Row.MissingCellPolicy.RETURN_NULL_AND_BLANK);
+                String value = resolveDisplayValue(cell, formatter, evaluator);
+                if (StringUtils.isNotEmpty(value))
+                {
+                    dedupe.add(value.trim());
+                }
+            }
+        }
+        return new ArrayList<String>(dedupe);
+    }
+
+    private String normalizeSheetName(String rawSheetName)
+    {
+        String sheetName = rawSheetName == null ? "" : rawSheetName.trim();
+        if (sheetName.startsWith("'") && sheetName.endsWith("'") && sheetName.length() > 1)
+        {
+            sheetName = sheetName.substring(1, sheetName.length() - 1).replace("''", "'");
+        }
+        return sheetName;
+    }
+
+    private List<Map<String, Object>> buildSheetImageView(Workbook workbook, Sheet sheet)
+    {
+        if (!(sheet instanceof XSSFSheet))
+        {
+            return new ArrayList<Map<String, Object>>();
+        }
+        XSSFSheet xssfSheet = (XSSFSheet) sheet;
+        List<Map<String, Object>> images = new ArrayList<Map<String, Object>>();
+        images.addAll(collectAnchoredImages(sheet, xssfSheet));
+        images.addAll(collectBackgroundImages(workbook, sheet, xssfSheet));
+        return images;
+    }
+
+    private List<Map<String, Object>> collectAnchoredImages(Sheet sheet, XSSFSheet xssfSheet)
+    {
+        List<Map<String, Object>> images = new ArrayList<Map<String, Object>>();
+        XSSFDrawing drawing = xssfSheet.getDrawingPatriarch();
+        if (drawing == null)
+        {
+            return images;
+        }
+        for (XSSFShape shape : drawing.getShapes())
+        {
+            if (!(shape instanceof XSSFPicture))
+            {
+                continue;
+            }
+            XSSFPicture picture = (XSSFPicture) shape;
+            Map<String, Object> image = buildAnchoredImageView(sheet, picture);
+            if (!image.isEmpty())
+            {
+                images.add(image);
+            }
+        }
+        return images;
+    }
+
+    private Map<String, Object> buildAnchoredImageView(Sheet sheet, XSSFPicture picture)
+    {
+        XSSFClientAnchor anchor = picture.getClientAnchor();
+        XSSFPictureData pictureData = picture.getPictureData();
+        if (anchor == null || pictureData == null)
+        {
+            return new LinkedHashMap<String, Object>();
+        }
+
+        int row1 = Math.max(anchor.getRow1(), 0);
+        int col1 = Math.max(anchor.getCol1(), 0);
+        int row2 = Math.max(anchor.getRow2(), row1);
+        int col2 = Math.max(anchor.getCol2(), col1);
+
+        int dx1Px = emuToPixel(anchor.getDx1());
+        int dx2Px = emuToPixel(anchor.getDx2());
+        int dy1Px = emuToPixel(anchor.getDy1());
+        int dy2Px = emuToPixel(anchor.getDy2());
+
+        int widthPx = resolveImageWidthPx(sheet, col1, col2, dx1Px, dx2Px);
+        int heightPx = resolveImageHeightPx(sheet, row1, row2, dy1Px, dy2Px);
+        if (widthPx <= 0 || heightPx <= 0)
+        {
+            int[] intrinsic = resolveIntrinsicImageSize(pictureData.getData());
+            if (widthPx <= 0)
+            {
+                widthPx = intrinsic[0];
+            }
+            if (heightPx <= 0)
+            {
+                heightPx = intrinsic[1];
+            }
+        }
+
+        Map<String, Object> image = new LinkedHashMap<String, Object>();
+        image.put("kind", "anchored");
+        image.put("row1", row1);
+        image.put("col1", col1);
+        image.put("row2", row2);
+        image.put("col2", col2);
+        image.put("dx1Px", Math.max(dx1Px, 0));
+        image.put("dx2Px", Math.max(dx2Px, 0));
+        image.put("dy1Px", Math.max(dy1Px, 0));
+        image.put("dy2Px", Math.max(dy2Px, 0));
+        image.put("widthPx", Math.max(widthPx, 1));
+        image.put("heightPx", Math.max(heightPx, 1));
+        image.put("src", buildImageDataUrl(pictureData));
+        image.put("mimeType", pictureData.getMimeType());
+        image.put("extension", pictureData.suggestFileExtension());
+        image.put("description", picture.getShapeName());
+        return image;
+    }
+
+    private List<Map<String, Object>> collectBackgroundImages(Workbook workbook, Sheet sheet, XSSFSheet xssfSheet)
+    {
+        List<Map<String, Object>> images = new ArrayList<Map<String, Object>>();
+        String relationshipId = resolveBackgroundPictureRelationId(xssfSheet);
+        if (StringUtils.isEmpty(relationshipId))
+        {
+            return images;
+        }
+
+        POIXMLDocumentPart relationPart = xssfSheet.getRelationById(relationshipId);
+        if (!(relationPart instanceof XSSFPictureData))
+        {
+            return images;
+        }
+
+        XSSFPictureData pictureData = (XSSFPictureData) relationPart;
+        int[] intrinsic = resolveIntrinsicImageSize(pictureData.getData());
+        int fallbackWidth = resolveSheetWidthPx(sheet);
+        int fallbackHeight = resolveSheetHeightPx(sheet);
+
+        Map<String, Object> image = new LinkedHashMap<String, Object>();
+        image.put("kind", "background");
+        image.put("row1", 0);
+        image.put("col1", 0);
+        image.put("row2", Math.max(resolveLastActiveRowIndex(sheet), 0));
+        image.put("col2", Math.max(resolveMaxColumnCount(sheet) - 1, 0));
+        image.put("dx1Px", 0);
+        image.put("dx2Px", 0);
+        image.put("dy1Px", 0);
+        image.put("dy2Px", 0);
+        image.put("widthPx", Math.max(intrinsic[0], fallbackWidth));
+        image.put("heightPx", Math.max(intrinsic[1], fallbackHeight));
+        image.put("src", buildImageDataUrl(pictureData));
+        image.put("mimeType", pictureData.getMimeType());
+        image.put("extension", pictureData.suggestFileExtension());
+        image.put("description", "SheetBackground");
+        images.add(image);
+        return images;
+    }
+
+    private String resolveBackgroundPictureRelationId(XSSFSheet xssfSheet)
+    {
+        if (xssfSheet == null || xssfSheet.getPackagePart() == null)
+        {
+            return "";
+        }
+        try (InputStream inputStream = xssfSheet.getPackagePart().getInputStream())
+        {
+            String worksheetXml = IOUtils.toString(inputStream, StandardCharsets.UTF_8);
+            Matcher matcher = BACKGROUND_PICTURE_RELATION_PATTERN.matcher(worksheetXml);
+            if (matcher.find())
+            {
+                return matcher.group(1);
+            }
+        }
+        catch (IOException e)
+        {
+            log.debug("Failed to resolve sheet background picture relation, sheet: {}", xssfSheet.getSheetName(), e);
+        }
+        return "";
+    }
+
+    private String buildImageDataUrl(XSSFPictureData pictureData)
+    {
+        String mimeType = StringUtils.isNotEmpty(pictureData.getMimeType()) ? pictureData.getMimeType()
+                : MediaType.APPLICATION_OCTET_STREAM_VALUE;
+        String base64Data = Base64.getEncoder().encodeToString(pictureData.getData());
+        return "data:" + mimeType + ";base64," + base64Data;
+    }
+
+    private int emuToPixel(int value)
+    {
+        return (int) Math.round(value / 9525D);
+    }
+
+    private int resolveImageWidthPx(Sheet sheet, int col1, int col2, int dx1Px, int dx2Px)
+    {
+        if (col2 < col1)
+        {
+            return 0;
+        }
+        if (col1 == col2)
+        {
+            return Math.max(dx2Px - dx1Px, 0);
+        }
+
+        int total = Math.max(approximateColumnWidthPx(sheet, col1) - dx1Px, 0);
+        for (int columnIndex = col1 + 1; columnIndex < col2; columnIndex++)
+        {
+            total += approximateColumnWidthPx(sheet, columnIndex);
+        }
+        total += Math.max(dx2Px, 0);
+        return total;
+    }
+
+    private int resolveImageHeightPx(Sheet sheet, int row1, int row2, int dy1Px, int dy2Px)
+    {
+        if (row2 < row1)
+        {
+            return 0;
+        }
+        if (row1 == row2)
+        {
+            return Math.max(dy2Px - dy1Px, 0);
+        }
+
+        int total = Math.max(resolveRowHeightPx(sheet, row1) - dy1Px, 0);
+        for (int rowIndex = row1 + 1; rowIndex < row2; rowIndex++)
+        {
+            total += resolveRowHeightPx(sheet, rowIndex);
+        }
+        total += Math.max(dy2Px, 0);
+        return total;
+    }
+
+    private int resolveSheetWidthPx(Sheet sheet)
+    {
+        int maxColumnCount = resolveMaxColumnCount(sheet);
+        int total = 0;
+        for (int columnIndex = 0; columnIndex < maxColumnCount; columnIndex++)
+        {
+            total += approximateColumnWidthPx(sheet, columnIndex);
+        }
+        return Math.max(total, 320);
+    }
+
+    private int resolveSheetHeightPx(Sheet sheet)
+    {
+        int lastRowIndex = resolveLastActiveRowIndex(sheet);
+        int total = 0;
+        for (int rowIndex = 0; rowIndex <= lastRowIndex; rowIndex++)
+        {
+            total += resolveRowHeightPx(sheet, rowIndex);
+        }
+        return Math.max(total, 160);
+    }
+
+    private int[] resolveIntrinsicImageSize(byte[] data)
+    {
+        int[] result = new int[] { 240, 160 };
+        if (data == null || data.length == 0)
+        {
+            return result;
+        }
+        try (ByteArrayInputStream inputStream = new ByteArrayInputStream(data))
+        {
+            BufferedImage image = ImageIO.read(inputStream);
+            if (image != null && image.getWidth() > 0 && image.getHeight() > 0)
+            {
+                result[0] = image.getWidth();
+                result[1] = image.getHeight();
+            }
+        }
+        catch (IOException e)
+        {
+            // Ignore image parse failure and use fallback dimensions.
+        }
+        return result;
+    }
+
+    private Map<String, Object> buildBorderStyle(Workbook workbook, CellStyle cellStyle)
+    {
+        Map<String, Object> style = new LinkedHashMap<String, Object>();
+        String top = resolveBorderCss(workbook, cellStyle, cellStyle.getBorderTop(), "top");
+        if (StringUtils.isNotEmpty(top))
+        {
+            style.put("borderTop", top);
+        }
+
+        String right = resolveBorderCss(workbook, cellStyle, cellStyle.getBorderRight(), "right");
+        if (StringUtils.isNotEmpty(right))
+        {
+            style.put("borderRight", right);
+        }
+
+        String bottom = resolveBorderCss(workbook, cellStyle, cellStyle.getBorderBottom(), "bottom");
+        if (StringUtils.isNotEmpty(bottom))
+        {
+            style.put("borderBottom", bottom);
+        }
+
+        String left = resolveBorderCss(workbook, cellStyle, cellStyle.getBorderLeft(), "left");
+        if (StringUtils.isNotEmpty(left))
+        {
+            style.put("borderLeft", left);
+        }
+
+        return style;
+    }
+
+    private String resolveBorderCss(Workbook workbook, CellStyle cellStyle, BorderStyle borderStyle, String side)
+    {
+        if (borderStyle == null || borderStyle == BorderStyle.NONE)
+        {
+            return "";
+        }
+        String lineStyle = toBorderCssLineStyle(borderStyle);
+        String lineWidth = toBorderCssWidth(borderStyle);
+        String color = resolveBorderColor(workbook, cellStyle, side);
+        if (StringUtils.isEmpty(color))
+        {
+            color = "#D9D9D9";
+        }
+        return lineWidth + " " + lineStyle + " " + color;
+    }
+
+    private String resolveBorderColor(Workbook workbook, CellStyle cellStyle, String side)
+    {
+        if (cellStyle instanceof XSSFCellStyle)
+        {
+            XSSFCellStyle xssfStyle = (XSSFCellStyle) cellStyle;
+            XSSFColor color = null;
+            if ("top".equals(side))
+            {
+                color = xssfStyle.getTopBorderXSSFColor();
+            }
+            else if ("right".equals(side))
+            {
+                color = xssfStyle.getRightBorderXSSFColor();
+            }
+            else if ("bottom".equals(side))
+            {
+                color = xssfStyle.getBottomBorderXSSFColor();
+            }
+            else if ("left".equals(side))
+            {
+                color = xssfStyle.getLeftBorderXSSFColor();
+            }
+            return toCssColor(color);
+        }
+
+        if (cellStyle instanceof HSSFCellStyle && workbook instanceof HSSFWorkbook)
+        {
+            HSSFCellStyle hssfStyle = (HSSFCellStyle) cellStyle;
+            short colorIndex = 0;
+            if ("top".equals(side))
+            {
+                colorIndex = hssfStyle.getTopBorderColor();
+            }
+            else if ("right".equals(side))
+            {
+                colorIndex = hssfStyle.getRightBorderColor();
+            }
+            else if ("bottom".equals(side))
+            {
+                colorIndex = hssfStyle.getBottomBorderColor();
+            }
+            else if ("left".equals(side))
+            {
+                colorIndex = hssfStyle.getLeftBorderColor();
+            }
+            HSSFPalette palette = ((HSSFWorkbook) workbook).getCustomPalette();
+            HSSFColor color = palette == null ? null : palette.getColor(colorIndex);
+            return toCssColor(color);
+        }
+        return "";
+    }
+
+    private String toBorderCssLineStyle(BorderStyle borderStyle)
+    {
+        switch (borderStyle)
+        {
+            case DOUBLE:
+                return "double";
+            case DASH_DOT:
+            case DASH_DOT_DOT:
+            case DOTTED:
+                return "dotted";
+            case DASHED:
+            case MEDIUM_DASH_DOT:
+            case MEDIUM_DASH_DOT_DOT:
+            case MEDIUM_DASHED:
+            case SLANTED_DASH_DOT:
+                return "dashed";
+            default:
+                return "solid";
+        }
+    }
+
+    private String toBorderCssWidth(BorderStyle borderStyle)
+    {
+        switch (borderStyle)
+        {
+            case MEDIUM:
+            case MEDIUM_DASH_DOT:
+            case MEDIUM_DASH_DOT_DOT:
+            case MEDIUM_DASHED:
+            case DOUBLE:
+                return "2px";
+            case THICK:
+                return "3px";
+            default:
+                return "1px";
+        }
     }
 
     private String resolveFillColor(CellStyle cellStyle)
@@ -965,6 +1717,8 @@ public class ExcelEditorController
 
         private List<CellPatch> changes;
 
+        private List<MergeRegionPatch> mergeRegions;
+
         public String getFileName()
         {
             return fileName;
@@ -983,6 +1737,16 @@ public class ExcelEditorController
         public void setChanges(List<CellPatch> changes)
         {
             this.changes = changes;
+        }
+
+        public List<MergeRegionPatch> getMergeRegions()
+        {
+            return mergeRegions;
+        }
+
+        public void setMergeRegions(List<MergeRegionPatch> mergeRegions)
+        {
+            this.mergeRegions = mergeRegions;
         }
     }
 
@@ -1034,6 +1798,69 @@ public class ExcelEditorController
         public void setValue(String value)
         {
             this.value = value;
+        }
+    }
+
+    public static class MergeRegionPatch
+    {
+        private String sheetName;
+
+        private Integer firstRow;
+
+        private Integer lastRow;
+
+        private Integer firstColumn;
+
+        private Integer lastColumn;
+
+        public String getSheetName()
+        {
+            return sheetName;
+        }
+
+        public void setSheetName(String sheetName)
+        {
+            this.sheetName = sheetName;
+        }
+
+        public Integer getFirstRow()
+        {
+            return firstRow;
+        }
+
+        public void setFirstRow(Integer firstRow)
+        {
+            this.firstRow = firstRow;
+        }
+
+        public Integer getLastRow()
+        {
+            return lastRow;
+        }
+
+        public void setLastRow(Integer lastRow)
+        {
+            this.lastRow = lastRow;
+        }
+
+        public Integer getFirstColumn()
+        {
+            return firstColumn;
+        }
+
+        public void setFirstColumn(Integer firstColumn)
+        {
+            this.firstColumn = firstColumn;
+        }
+
+        public Integer getLastColumn()
+        {
+            return lastColumn;
+        }
+
+        public void setLastColumn(Integer lastColumn)
+        {
+            this.lastColumn = lastColumn;
         }
     }
 }
