@@ -112,6 +112,14 @@ public class ExcelEditorController
      */
     private static final int MAX_PATCH_CHANGES = 100000;
 
+    private static final int MIN_ROW_HEIGHT_PX = 24;
+
+    private static final int MAX_ROW_HEIGHT_PX = 1200;
+
+    private static final int MIN_COLUMN_WIDTH_PX = 40;
+
+    private static final int MAX_COLUMN_WIDTH_PX = 1600;
+
     private static final DateTimeFormatter[] DATE_TIME_FORMATTERS = {
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
             DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss"),
@@ -233,7 +241,8 @@ public class ExcelEditorController
                 return AjaxResult.error("The selected Excel file does not exist");
             }
 
-            applyWorkbookChanges(targetFile.get(), request.getChanges(), request.getMergeRegions());
+            applyWorkbookChanges(targetFile.get(), request.getChanges(), request.getMergeRegions(), request.getRowHeights(),
+                    request.getColumnWidths());
             return AjaxResult.success("Excel saved and original formatting was preserved", buildUploadResponse(targetFile.get()));
         }
         catch (IllegalArgumentException e)
@@ -472,8 +481,8 @@ public class ExcelEditorController
         return style;
     }
 
-    private void applyWorkbookChanges(Path workbookPath, List<CellPatch> changes, List<MergeRegionPatch> mergeRegions)
-            throws Exception
+    private void applyWorkbookChanges(Path workbookPath, List<CellPatch> changes, List<MergeRegionPatch> mergeRegions,
+            List<RowHeightPatch> rowHeights, List<ColumnWidthPatch> columnWidths) throws Exception
     {
         if (changes != null && changes.size() > MAX_PATCH_CHANGES)
         {
@@ -497,6 +506,16 @@ public class ExcelEditorController
             if (mergeRegions != null)
             {
                 applyWorkbookMergeLayout(workbook, mergeRegions);
+            }
+
+            if (rowHeights != null)
+            {
+                applyWorkbookRowHeights(workbook, rowHeights);
+            }
+
+            if (columnWidths != null)
+            {
+                applyWorkbookColumnWidths(workbook, columnWidths);
             }
 
             workbook.setForceFormulaRecalculation(true);
@@ -574,6 +593,81 @@ public class ExcelEditorController
                 sheet.addMergedRegion(region);
             }
         }
+    }
+
+    private void applyWorkbookRowHeights(Workbook workbook, List<RowHeightPatch> rowHeights)
+    {
+        for (RowHeightPatch patch : rowHeights)
+        {
+            if (patch == null || StringUtils.isEmpty(patch.getSheetName()) || patch.getRowIndex() == null
+                    || patch.getHeightPx() == null)
+            {
+                continue;
+            }
+
+            Sheet sheet = workbook.getSheet(patch.getSheetName());
+            if (sheet == null)
+            {
+                continue;
+            }
+
+            int rowIndex = patch.getRowIndex().intValue();
+            if (rowIndex < 0 || rowIndex > resolveLastActiveRowIndex(sheet))
+            {
+                throw new IllegalArgumentException("Row out of sheet bounds: " + sheet.getSheetName() + "!"
+                        + (rowIndex + 1));
+            }
+
+            int safeHeightPx = Math.max(MIN_ROW_HEIGHT_PX, Math.min(MAX_ROW_HEIGHT_PX, patch.getHeightPx().intValue()));
+            Row row = sheet.getRow(rowIndex);
+            if (row == null)
+            {
+                row = sheet.createRow(rowIndex);
+            }
+            row.setHeightInPoints(pixelToPoints(safeHeightPx));
+        }
+    }
+
+    private void applyWorkbookColumnWidths(Workbook workbook, List<ColumnWidthPatch> columnWidths)
+    {
+        for (ColumnWidthPatch patch : columnWidths)
+        {
+            if (patch == null || StringUtils.isEmpty(patch.getSheetName()) || patch.getColIndex() == null
+                    || patch.getWidthPx() == null)
+            {
+                continue;
+            }
+
+            Sheet sheet = workbook.getSheet(patch.getSheetName());
+            if (sheet == null)
+            {
+                continue;
+            }
+
+            int colIndex = patch.getColIndex().intValue();
+            int maxColumnCount = resolveMaxColumnCount(sheet);
+            if (colIndex < 0 || colIndex >= maxColumnCount)
+            {
+                throw new IllegalArgumentException("Column out of sheet bounds: " + sheet.getSheetName() + "!"
+                        + toColumnLabel(colIndex));
+            }
+
+            int safeWidthPx = Math.max(MIN_COLUMN_WIDTH_PX, Math.min(MAX_COLUMN_WIDTH_PX, patch.getWidthPx().intValue()));
+            sheet.setColumnWidth(colIndex, pixelToExcelWidthUnits(safeWidthPx));
+        }
+    }
+
+    private float pixelToPoints(int heightPx)
+    {
+        return (float) (heightPx * 72D / 96D);
+    }
+
+    private int pixelToExcelWidthUnits(int widthPx)
+    {
+        int units = (int) Math.round(((Math.max(widthPx, 1) - 12D) / 7D) * 256D);
+        int minUnits = 256;
+        int maxUnits = 255 * 256;
+        return Math.max(minUnits, Math.min(maxUnits, units));
     }
 
     private CellRangeAddress toCellRangeAddress(MergeRegionPatch mergeRegion)
@@ -1930,6 +2024,10 @@ public class ExcelEditorController
 
         private List<MergeRegionPatch> mergeRegions;
 
+        private List<RowHeightPatch> rowHeights;
+
+        private List<ColumnWidthPatch> columnWidths;
+
         public String getFileName()
         {
             return fileName;
@@ -1958,6 +2056,26 @@ public class ExcelEditorController
         public void setMergeRegions(List<MergeRegionPatch> mergeRegions)
         {
             this.mergeRegions = mergeRegions;
+        }
+
+        public List<RowHeightPatch> getRowHeights()
+        {
+            return rowHeights;
+        }
+
+        public void setRowHeights(List<RowHeightPatch> rowHeights)
+        {
+            this.rowHeights = rowHeights;
+        }
+
+        public List<ColumnWidthPatch> getColumnWidths()
+        {
+            return columnWidths;
+        }
+
+        public void setColumnWidths(List<ColumnWidthPatch> columnWidths)
+        {
+            this.columnWidths = columnWidths;
         }
     }
 
@@ -2072,6 +2190,84 @@ public class ExcelEditorController
         public void setLastColumn(Integer lastColumn)
         {
             this.lastColumn = lastColumn;
+        }
+    }
+
+    public static class RowHeightPatch
+    {
+        private String sheetName;
+
+        private Integer rowIndex;
+
+        private Integer heightPx;
+
+        public String getSheetName()
+        {
+            return sheetName;
+        }
+
+        public void setSheetName(String sheetName)
+        {
+            this.sheetName = sheetName;
+        }
+
+        public Integer getRowIndex()
+        {
+            return rowIndex;
+        }
+
+        public void setRowIndex(Integer rowIndex)
+        {
+            this.rowIndex = rowIndex;
+        }
+
+        public Integer getHeightPx()
+        {
+            return heightPx;
+        }
+
+        public void setHeightPx(Integer heightPx)
+        {
+            this.heightPx = heightPx;
+        }
+    }
+
+    public static class ColumnWidthPatch
+    {
+        private String sheetName;
+
+        private Integer colIndex;
+
+        private Integer widthPx;
+
+        public String getSheetName()
+        {
+            return sheetName;
+        }
+
+        public void setSheetName(String sheetName)
+        {
+            this.sheetName = sheetName;
+        }
+
+        public Integer getColIndex()
+        {
+            return colIndex;
+        }
+
+        public void setColIndex(Integer colIndex)
+        {
+            this.colIndex = colIndex;
+        }
+
+        public Integer getWidthPx()
+        {
+            return widthPx;
+        }
+
+        public void setWidthPx(Integer widthPx)
+        {
+            this.widthPx = widthPx;
         }
     }
 }
