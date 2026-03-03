@@ -23,6 +23,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Base64;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,6 +31,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -86,6 +88,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 import com.ruoyi.common.config.RuoYiConfig;
 import com.ruoyi.common.core.domain.AjaxResult;
+import com.ruoyi.common.utils.SecurityUtils;
 import com.ruoyi.common.utils.StringUtils;
 import com.ruoyi.common.utils.file.FileUploadUtils;
 import com.ruoyi.common.utils.file.FileUtils;
@@ -119,6 +122,12 @@ public class ExcelEditorController
     private static final int MIN_COLUMN_WIDTH_PX = 40;
 
     private static final int MAX_COLUMN_WIDTH_PX = 1600;
+
+    private static final long LOCK_TIMEOUT_MILLIS = 5 * 60 * 1000L;
+
+    private static final Map<String, FileEditLock> FILE_EDIT_LOCKS = new ConcurrentHashMap<String, FileEditLock>();
+
+    private static final Object FILE_EDIT_LOCK_MONITOR = new Object();
 
     private static final DateTimeFormatter[] DATE_TIME_FORMATTERS = {
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
@@ -225,6 +234,123 @@ public class ExcelEditorController
         }
     }
 
+    @GetMapping("/lock")
+    public AjaxResult lockStatus(@RequestParam("fileName") String fileName)
+    {
+        try
+        {
+            Optional<Path> targetFile = resolveFileByName(fileName);
+            if (!targetFile.isPresent())
+            {
+                return AjaxResult.error("The selected Excel file does not exist");
+            }
+            EditorIdentity editor = resolveEditorIdentity();
+            String safeFileName = targetFile.get().getFileName().toString();
+            FileEditLock currentLock = getActiveLock(safeFileName);
+            return AjaxResult.success("Lock status loaded",
+                    buildLockResponseData(safeFileName, currentLock, editor, false));
+        }
+        catch (Exception e)
+        {
+            log.error("Failed to read lock status", e);
+            return AjaxResult.error("Failed to read lock status");
+        }
+    }
+
+    @PostMapping("/lock")
+    public AjaxResult lock(@RequestBody FileLockRequest request)
+    {
+        try
+        {
+            if (request == null || StringUtils.isEmpty(request.getFileName()))
+            {
+                return AjaxResult.error("File name is required");
+            }
+
+            Optional<Path> targetFile = resolveFileByName(request.getFileName());
+            if (!targetFile.isPresent())
+            {
+                return AjaxResult.error("The selected Excel file does not exist");
+            }
+
+            EditorIdentity editor = resolveEditorIdentity();
+            String safeFileName = targetFile.get().getFileName().toString();
+            LockOperationResult lockResult = acquireFileLock(safeFileName, editor, request.isForce());
+            if (!lockResult.isSuccess())
+            {
+                return AjaxResult.error(lockResult.getMessage(),
+                        buildLockResponseData(safeFileName, lockResult.getLock(), editor, false));
+            }
+            return AjaxResult.success("Lock acquired", buildLockResponseData(safeFileName, lockResult.getLock(), editor, true));
+        }
+        catch (Exception e)
+        {
+            log.error("Failed to acquire file lock", e);
+            return AjaxResult.error("Failed to acquire file lock");
+        }
+    }
+
+    @PostMapping("/lock/heartbeat")
+    public AjaxResult lockHeartbeat(@RequestBody FileLockRequest request)
+    {
+        try
+        {
+            if (request == null || StringUtils.isEmpty(request.getFileName()))
+            {
+                return AjaxResult.error("File name is required");
+            }
+
+            Optional<Path> targetFile = resolveFileByName(request.getFileName());
+            if (!targetFile.isPresent())
+            {
+                return AjaxResult.error("The selected Excel file does not exist");
+            }
+
+            EditorIdentity editor = resolveEditorIdentity();
+            String safeFileName = targetFile.get().getFileName().toString();
+            LockOperationResult lockResult = refreshFileLock(safeFileName, editor);
+            if (!lockResult.isSuccess())
+            {
+                return AjaxResult.error(lockResult.getMessage(),
+                        buildLockResponseData(safeFileName, lockResult.getLock(), editor, false));
+            }
+            return AjaxResult.success("Lock heartbeat accepted",
+                    buildLockResponseData(safeFileName, lockResult.getLock(), editor, true));
+        }
+        catch (Exception e)
+        {
+            log.error("Failed to refresh file lock", e);
+            return AjaxResult.error("Failed to refresh file lock");
+        }
+    }
+
+    @PostMapping("/lock/release")
+    public AjaxResult lockRelease(@RequestBody FileLockRequest request)
+    {
+        try
+        {
+            if (request == null || StringUtils.isEmpty(request.getFileName()))
+            {
+                return AjaxResult.error("File name is required");
+            }
+
+            String safeFileName = FilenameUtils.getName(request.getFileName());
+            EditorIdentity editor = resolveEditorIdentity();
+            LockOperationResult releaseResult = releaseFileLock(safeFileName, editor, request.isForce());
+            if (!releaseResult.isSuccess())
+            {
+                return AjaxResult.error(releaseResult.getMessage(),
+                        buildLockResponseData(safeFileName, releaseResult.getLock(), editor, false));
+            }
+            return AjaxResult.success("Lock released", buildLockResponseData(safeFileName, null, editor, true));
+        }
+        catch (Exception e)
+        {
+            log.error("Failed to release file lock", e);
+            return AjaxResult.error("Failed to release file lock");
+        }
+    }
+
     @PostMapping("/apply")
     public AjaxResult apply(@RequestBody WorkbookPatchRequest request)
     {
@@ -239,6 +365,29 @@ public class ExcelEditorController
             if (!targetFile.isPresent())
             {
                 return AjaxResult.error("The selected Excel file does not exist");
+            }
+
+            EditorIdentity editor = resolveEditorIdentity();
+            String safeFileName = targetFile.get().getFileName().toString();
+            LockValidationResult lockValidation = validateLockForWrite(safeFileName, editor);
+            if (!lockValidation.isAllowed())
+            {
+                return AjaxResult.error(lockValidation.getMessage(),
+                        buildLockResponseData(safeFileName, lockValidation.getLock(), editor, false));
+            }
+
+            if (StringUtils.isEmpty(request.getVersion()))
+            {
+                Map<String, Object> data = buildUploadResponse(targetFile.get());
+                data.put("versionConflict", true);
+                return AjaxResult.error("Workbook version is required. Please reload and retry.", data);
+            }
+            String currentVersion = buildFileVersion(targetFile.get());
+            if (!StringUtils.equals(request.getVersion(), currentVersion))
+            {
+                Map<String, Object> data = buildUploadResponse(targetFile.get());
+                data.put("versionConflict", true);
+                return AjaxResult.error("Workbook has changed on server. Please reload before saving.", data);
             }
 
             applyWorkbookChanges(targetFile.get(), request.getChanges(), request.getMergeRegions(), request.getRowHeights(),
@@ -261,6 +410,7 @@ public class ExcelEditorController
         Map<String, Object> data = new LinkedHashMap<String, Object>();
         data.putAll(buildFileInfo(storedFile));
         data.put("currentFileName", storedFile.getFileName().toString());
+        data.put("version", buildFileVersion(storedFile));
         data.put("files", listStoredFiles());
         return data;
     }
@@ -271,6 +421,7 @@ public class ExcelEditorController
         data.putAll(buildFileInfo(workbookPath));
         data.put("fileName", workbookPath.getFileName().toString());
         data.put("currentFileName", workbookPath.getFileName().toString());
+        data.put("version", buildFileVersion(workbookPath));
 
         try (InputStream inputStream = Files.newInputStream(workbookPath);
                 Workbook workbook = WorkbookFactory.create(inputStream))
@@ -285,6 +436,159 @@ public class ExcelEditorController
             data.put("sheetCount", workbook.getNumberOfSheets());
             data.put("sheets", sheets);
         }
+        return data;
+    }
+
+    private String buildFileVersion(Path filePath) throws IOException
+    {
+        long lastModified = Files.getLastModifiedTime(filePath).toMillis();
+        long fileSize = Files.size(filePath);
+        return lastModified + ":" + fileSize;
+    }
+
+    private EditorIdentity resolveEditorIdentity()
+    {
+        Long userId = SecurityUtils.getUserId();
+        String username = SecurityUtils.getUsername();
+        if (StringUtils.isEmpty(username))
+        {
+            username = userId == null ? "Anonymous" : "User-" + userId;
+        }
+        return new EditorIdentity(userId, username);
+    }
+
+    private LockOperationResult acquireFileLock(String fileName, EditorIdentity editor, boolean forceTakeover)
+    {
+        long now = System.currentTimeMillis();
+        synchronized (FILE_EDIT_LOCK_MONITOR)
+        {
+            cleanupExpiredLocks(now);
+            FileEditLock current = FILE_EDIT_LOCKS.get(fileName);
+            if (current == null || current.isOwnedBy(editor) || forceTakeover)
+            {
+                FileEditLock next = new FileEditLock(fileName, editor.getUserId(), editor.getUsername(), now,
+                        now + LOCK_TIMEOUT_MILLIS);
+                FILE_EDIT_LOCKS.put(fileName, next);
+                return LockOperationResult.success(next);
+            }
+            return LockOperationResult.failure(current,
+                    "File is currently being edited by " + current.getOwnerUsername() + ".");
+        }
+    }
+
+    private LockOperationResult refreshFileLock(String fileName, EditorIdentity editor)
+    {
+        long now = System.currentTimeMillis();
+        synchronized (FILE_EDIT_LOCK_MONITOR)
+        {
+            cleanupExpiredLocks(now);
+            FileEditLock current = FILE_EDIT_LOCKS.get(fileName);
+            if (current == null)
+            {
+                return LockOperationResult.failure(null, "Edit lock expired. Please re-open the file.");
+            }
+            if (!current.isOwnedBy(editor))
+            {
+                return LockOperationResult.failure(current,
+                        "File is currently being edited by " + current.getOwnerUsername() + ".");
+            }
+            current.setExpiresAt(now + LOCK_TIMEOUT_MILLIS);
+            current.setUpdatedAt(now);
+            return LockOperationResult.success(current);
+        }
+    }
+
+    private LockOperationResult releaseFileLock(String fileName, EditorIdentity editor, boolean forceRelease)
+    {
+        long now = System.currentTimeMillis();
+        synchronized (FILE_EDIT_LOCK_MONITOR)
+        {
+            cleanupExpiredLocks(now);
+            FileEditLock current = FILE_EDIT_LOCKS.get(fileName);
+            if (current == null)
+            {
+                return LockOperationResult.success(null);
+            }
+            if (!current.isOwnedBy(editor) && !forceRelease)
+            {
+                return LockOperationResult.failure(current,
+                        "File is currently being edited by " + current.getOwnerUsername() + ".");
+            }
+            FILE_EDIT_LOCKS.remove(fileName);
+            return LockOperationResult.success(null);
+        }
+    }
+
+    private FileEditLock getActiveLock(String fileName)
+    {
+        long now = System.currentTimeMillis();
+        synchronized (FILE_EDIT_LOCK_MONITOR)
+        {
+            cleanupExpiredLocks(now);
+            return FILE_EDIT_LOCKS.get(fileName);
+        }
+    }
+
+    private LockValidationResult validateLockForWrite(String fileName, EditorIdentity editor)
+    {
+        long now = System.currentTimeMillis();
+        synchronized (FILE_EDIT_LOCK_MONITOR)
+        {
+            cleanupExpiredLocks(now);
+            FileEditLock current = FILE_EDIT_LOCKS.get(fileName);
+            if (current == null)
+            {
+                return LockValidationResult.failure(null,
+                        "Edit lock not found. Please reopen the workbook.");
+            }
+            if (!current.isOwnedBy(editor))
+            {
+                return LockValidationResult.failure(current,
+                        "File is currently being edited by " + current.getOwnerUsername() + ".");
+            }
+            current.setExpiresAt(now + LOCK_TIMEOUT_MILLIS);
+            current.setUpdatedAt(now);
+            return LockValidationResult.success(current);
+        }
+    }
+
+    private void cleanupExpiredLocks(long now)
+    {
+        Iterator<Map.Entry<String, FileEditLock>> iterator = FILE_EDIT_LOCKS.entrySet().iterator();
+        while (iterator.hasNext())
+        {
+            Map.Entry<String, FileEditLock> entry = iterator.next();
+            FileEditLock lock = entry.getValue();
+            if (lock == null || lock.getExpiresAt() <= now)
+            {
+                iterator.remove();
+            }
+        }
+    }
+
+    private Map<String, Object> buildLockResponseData(String fileName, FileEditLock lock, EditorIdentity editor,
+            boolean acquired)
+    {
+        Map<String, Object> data = new LinkedHashMap<String, Object>();
+        data.put("fileName", fileName);
+        data.put("timeoutMs", LOCK_TIMEOUT_MILLIS);
+        data.put("acquired", acquired);
+        if (lock == null)
+        {
+            data.put("locked", false);
+            data.put("self", false);
+            return data;
+        }
+
+        long now = System.currentTimeMillis();
+        data.put("locked", true);
+        data.put("self", lock.isOwnedBy(editor));
+        data.put("ownerUserId", lock.getOwnerUserId());
+        data.put("ownerUsername", lock.getOwnerUsername());
+        data.put("createdAt", lock.getCreatedAt());
+        data.put("updatedAt", lock.getUpdatedAt());
+        data.put("expiresAt", lock.getExpiresAt());
+        data.put("remainingMs", Math.max(lock.getExpiresAt() - now, 0L));
         return data;
     }
 
@@ -2020,6 +2324,8 @@ public class ExcelEditorController
     {
         private String fileName;
 
+        private String version;
+
         private List<CellPatch> changes;
 
         private List<MergeRegionPatch> mergeRegions;
@@ -2036,6 +2342,16 @@ public class ExcelEditorController
         public void setFileName(String fileName)
         {
             this.fileName = fileName;
+        }
+
+        public String getVersion()
+        {
+            return version;
+        }
+
+        public void setVersion(String version)
+        {
+            this.version = version;
         }
 
         public List<CellPatch> getChanges()
@@ -2268,6 +2584,220 @@ public class ExcelEditorController
         public void setWidthPx(Integer widthPx)
         {
             this.widthPx = widthPx;
+        }
+    }
+
+    public static class FileLockRequest
+    {
+        private String fileName;
+
+        private boolean force;
+
+        public String getFileName()
+        {
+            return fileName;
+        }
+
+        public void setFileName(String fileName)
+        {
+            this.fileName = fileName;
+        }
+
+        public boolean isForce()
+        {
+            return force;
+        }
+
+        public void setForce(boolean force)
+        {
+            this.force = force;
+        }
+    }
+
+    private static class EditorIdentity
+    {
+        private final Long userId;
+
+        private final String username;
+
+        EditorIdentity(Long userId, String username)
+        {
+            this.userId = userId;
+            this.username = username;
+        }
+
+        Long getUserId()
+        {
+            return userId;
+        }
+
+        String getUsername()
+        {
+            return username;
+        }
+    }
+
+    private static class FileEditLock
+    {
+        private final String fileName;
+
+        private final Long ownerUserId;
+
+        private final String ownerUsername;
+
+        private final long createdAt;
+
+        private long updatedAt;
+
+        private long expiresAt;
+
+        FileEditLock(String fileName, Long ownerUserId, String ownerUsername, long createdAt, long expiresAt)
+        {
+            this.fileName = fileName;
+            this.ownerUserId = ownerUserId;
+            this.ownerUsername = ownerUsername;
+            this.createdAt = createdAt;
+            this.updatedAt = createdAt;
+            this.expiresAt = expiresAt;
+        }
+
+        boolean isOwnedBy(EditorIdentity editor)
+        {
+            if (editor == null)
+            {
+                return false;
+            }
+            if (ownerUserId != null && editor.getUserId() != null)
+            {
+                return ownerUserId.equals(editor.getUserId());
+            }
+            if (StringUtils.isEmpty(ownerUsername) || StringUtils.isEmpty(editor.getUsername()))
+            {
+                return false;
+            }
+            return ownerUsername.equals(editor.getUsername());
+        }
+
+        String getFileName()
+        {
+            return fileName;
+        }
+
+        Long getOwnerUserId()
+        {
+            return ownerUserId;
+        }
+
+        String getOwnerUsername()
+        {
+            return ownerUsername;
+        }
+
+        long getCreatedAt()
+        {
+            return createdAt;
+        }
+
+        long getUpdatedAt()
+        {
+            return updatedAt;
+        }
+
+        void setUpdatedAt(long updatedAt)
+        {
+            this.updatedAt = updatedAt;
+        }
+
+        long getExpiresAt()
+        {
+            return expiresAt;
+        }
+
+        void setExpiresAt(long expiresAt)
+        {
+            this.expiresAt = expiresAt;
+        }
+    }
+
+    private static class LockOperationResult
+    {
+        private final boolean success;
+
+        private final FileEditLock lock;
+
+        private final String message;
+
+        private LockOperationResult(boolean success, FileEditLock lock, String message)
+        {
+            this.success = success;
+            this.lock = lock;
+            this.message = message;
+        }
+
+        static LockOperationResult success(FileEditLock lock)
+        {
+            return new LockOperationResult(true, lock, "");
+        }
+
+        static LockOperationResult failure(FileEditLock lock, String message)
+        {
+            return new LockOperationResult(false, lock, message);
+        }
+
+        boolean isSuccess()
+        {
+            return success;
+        }
+
+        FileEditLock getLock()
+        {
+            return lock;
+        }
+
+        String getMessage()
+        {
+            return message;
+        }
+    }
+
+    private static class LockValidationResult
+    {
+        private final boolean allowed;
+
+        private final FileEditLock lock;
+
+        private final String message;
+
+        private LockValidationResult(boolean allowed, FileEditLock lock, String message)
+        {
+            this.allowed = allowed;
+            this.lock = lock;
+            this.message = message;
+        }
+
+        static LockValidationResult success(FileEditLock lock)
+        {
+            return new LockValidationResult(true, lock, "");
+        }
+
+        static LockValidationResult failure(FileEditLock lock, String message)
+        {
+            return new LockValidationResult(false, lock, message);
+        }
+
+        boolean isAllowed()
+        {
+            return allowed;
+        }
+
+        FileEditLock getLock()
+        {
+            return lock;
+        }
+
+        String getMessage()
+        {
+            return message;
         }
     }
 }
