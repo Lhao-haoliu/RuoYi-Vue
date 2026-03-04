@@ -58,15 +58,19 @@ import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.FillPatternType;
 import org.apache.poi.ss.usermodel.Font;
 import org.apache.poi.ss.usermodel.FormulaEvaluator;
+import org.apache.poi.ss.usermodel.HorizontalAlignment;
+import org.apache.poi.ss.usermodel.IndexedColors;
 import org.apache.poi.ss.usermodel.Name;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.VerticalAlignment;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.usermodel.WorkbookFactory;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.ss.util.CellRangeAddressList;
 import org.apache.poi.ss.util.CellReference;
 import org.apache.poi.ss.util.PaneInformation;
+import org.apache.poi.xssf.usermodel.DefaultIndexedColorMap;
 import org.apache.poi.xssf.usermodel.XSSFColor;
 import org.apache.poi.xssf.usermodel.XSSFCellStyle;
 import org.apache.poi.xssf.usermodel.XSSFClientAnchor;
@@ -391,7 +395,7 @@ public class ExcelEditorController
             }
 
             applyWorkbookChanges(targetFile.get(), request.getChanges(), request.getMergeRegions(), request.getRowHeights(),
-                    request.getColumnWidths());
+                    request.getColumnWidths(), request.getStructures());
             return AjaxResult.success("Excel saved and original formatting was preserved", buildUploadResponse(targetFile.get()));
         }
         catch (IllegalArgumentException e)
@@ -786,7 +790,8 @@ public class ExcelEditorController
     }
 
     private void applyWorkbookChanges(Path workbookPath, List<CellPatch> changes, List<MergeRegionPatch> mergeRegions,
-            List<RowHeightPatch> rowHeights, List<ColumnWidthPatch> columnWidths) throws Exception
+            List<RowHeightPatch> rowHeights, List<ColumnWidthPatch> columnWidths, List<WorkbookStructurePatch> structures)
+            throws Exception
     {
         if (changes != null && changes.size() > MAX_PATCH_CHANGES)
         {
@@ -799,6 +804,10 @@ public class ExcelEditorController
         {
             DataFormatter formatter = new DataFormatter(Locale.getDefault());
             FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
+            if (structures != null)
+            {
+                applyWorkbookStructures(workbook, structures);
+            }
             if (changes != null)
             {
                 for (CellPatch change : changes)
@@ -841,6 +850,443 @@ public class ExcelEditorController
 
         Files.move(tempFile, workbookPath, StandardCopyOption.REPLACE_EXISTING);
         writeCurrentMarker(workbookPath.getFileName().toString());
+    }
+
+    private void applyWorkbookStructures(Workbook workbook, List<WorkbookStructurePatch> structures)
+    {
+        for (WorkbookStructurePatch patch : structures)
+        {
+            if (patch == null || StringUtils.isEmpty(patch.getType()) || StringUtils.isEmpty(patch.getAction()))
+            {
+                continue;
+            }
+            String type = patch.getType().trim().toLowerCase(Locale.ROOT);
+            if ("sheet".equals(type))
+            {
+                applySheetStructure(workbook, patch);
+                continue;
+            }
+            if ("row".equals(type))
+            {
+                applyRowStructure(workbook, patch);
+                continue;
+            }
+            if ("column".equals(type))
+            {
+                applyColumnStructure(workbook, patch);
+            }
+        }
+    }
+
+    private void applySheetStructure(Workbook workbook, WorkbookStructurePatch patch)
+    {
+        String action = patch.getAction().trim().toLowerCase(Locale.ROOT);
+        if ("add".equals(action))
+        {
+            String targetSheetName = StringUtils.trim(patch.getTargetSheetName());
+            if (StringUtils.isEmpty(targetSheetName))
+            {
+                return;
+            }
+            if (workbook.getSheet(targetSheetName) != null)
+            {
+                throw new IllegalArgumentException("Sheet already exists: " + targetSheetName);
+            }
+            workbook.createSheet(targetSheetName);
+            Integer targetIndex = patch.getTargetIndex();
+            if (targetIndex != null)
+            {
+                int safeIndex = Math.max(0, Math.min(targetIndex.intValue(), workbook.getNumberOfSheets() - 1));
+                workbook.setSheetOrder(targetSheetName, safeIndex);
+            }
+            return;
+        }
+        if ("rename".equals(action))
+        {
+            if (StringUtils.isEmpty(patch.getSheetName()) || StringUtils.isEmpty(patch.getTargetSheetName()))
+            {
+                return;
+            }
+            int sourceIndex = workbook.getSheetIndex(patch.getSheetName());
+            if (sourceIndex < 0)
+            {
+                return;
+            }
+            if (workbook.getSheet(patch.getTargetSheetName()) != null)
+            {
+                throw new IllegalArgumentException("Sheet already exists: " + patch.getTargetSheetName());
+            }
+            workbook.setSheetName(sourceIndex, patch.getTargetSheetName());
+            return;
+        }
+        if ("delete".equals(action))
+        {
+            if (StringUtils.isEmpty(patch.getSheetName()))
+            {
+                return;
+            }
+            int sourceIndex = workbook.getSheetIndex(patch.getSheetName());
+            if (sourceIndex < 0)
+            {
+                return;
+            }
+            if (workbook.getNumberOfSheets() <= 1)
+            {
+                throw new IllegalArgumentException("Workbook must keep at least one sheet");
+            }
+            workbook.removeSheetAt(sourceIndex);
+            return;
+        }
+        if ("copy".equals(action))
+        {
+            if (StringUtils.isEmpty(patch.getSheetName()) || StringUtils.isEmpty(patch.getTargetSheetName()))
+            {
+                return;
+            }
+            int sourceIndex = workbook.getSheetIndex(patch.getSheetName());
+            if (sourceIndex < 0)
+            {
+                return;
+            }
+            if (workbook.getSheet(patch.getTargetSheetName()) != null)
+            {
+                throw new IllegalArgumentException("Sheet already exists: " + patch.getTargetSheetName());
+            }
+            Sheet copiedSheet = workbook.cloneSheet(sourceIndex);
+            int copiedSheetIndex = workbook.getSheetIndex(copiedSheet);
+            workbook.setSheetName(copiedSheetIndex, patch.getTargetSheetName());
+            Integer targetIndex = patch.getTargetIndex();
+            if (targetIndex != null)
+            {
+                int safeIndex = Math.max(0, Math.min(targetIndex.intValue(), workbook.getNumberOfSheets() - 1));
+                workbook.setSheetOrder(patch.getTargetSheetName(), safeIndex);
+            }
+            return;
+        }
+        if ("reorder".equals(action))
+        {
+            if (StringUtils.isEmpty(patch.getSheetName()) || patch.getTargetIndex() == null)
+            {
+                return;
+            }
+            int sourceIndex = workbook.getSheetIndex(patch.getSheetName());
+            if (sourceIndex < 0)
+            {
+                return;
+            }
+            int safeIndex = Math.max(0, Math.min(patch.getTargetIndex().intValue(), workbook.getNumberOfSheets() - 1));
+            workbook.setSheetOrder(patch.getSheetName(), safeIndex);
+        }
+    }
+
+    private void applyRowStructure(Workbook workbook, WorkbookStructurePatch patch)
+    {
+        if (StringUtils.isEmpty(patch.getSheetName()) || patch.getIndex() == null)
+        {
+            return;
+        }
+        Sheet sheet = workbook.getSheet(patch.getSheetName());
+        if (sheet == null)
+        {
+            return;
+        }
+        int count = Math.max(patch.getCount() == null ? 1 : patch.getCount().intValue(), 1);
+        int index = Math.max(patch.getIndex().intValue(), 0);
+        String action = patch.getAction().trim().toLowerCase(Locale.ROOT);
+        if ("insert".equals(action))
+        {
+            insertRows(sheet, index, count);
+            return;
+        }
+        if ("delete".equals(action))
+        {
+            deleteRows(sheet, index, count);
+        }
+    }
+
+    private void insertRows(Sheet sheet, int index, int count)
+    {
+        int safeIndex = Math.max(index, 0);
+        for (int offset = 0; offset < count; offset++)
+        {
+            insertSingleRow(sheet, safeIndex + offset);
+        }
+    }
+
+    private void insertSingleRow(Sheet sheet, int rowIndex)
+    {
+        int lastRowIndex = Math.max(sheet.getLastRowNum(), resolveLastActiveRowIndex(sheet));
+        if (rowIndex <= lastRowIndex)
+        {
+            sheet.shiftRows(rowIndex, lastRowIndex, 1, true, false);
+        }
+        Row newRow = sheet.createRow(rowIndex);
+        Row templateRow = rowIndex > 0 ? sheet.getRow(rowIndex - 1) : sheet.getRow(rowIndex + 1);
+        if (templateRow != null)
+        {
+            newRow.setHeight(templateRow.getHeight());
+            short firstCellNum = templateRow.getFirstCellNum();
+            short lastCellNum = templateRow.getLastCellNum();
+            if (firstCellNum >= 0 && lastCellNum > firstCellNum)
+            {
+                for (int columnIndex = firstCellNum; columnIndex < lastCellNum; columnIndex++)
+                {
+                    Cell templateCell = templateRow.getCell(columnIndex);
+                    if (templateCell == null)
+                    {
+                        continue;
+                    }
+                    Cell newCell = newRow.createCell(columnIndex);
+                    newCell.setCellStyle(templateCell.getCellStyle());
+                    newCell.setBlank();
+                }
+            }
+        }
+    }
+
+    private void deleteRows(Sheet sheet, int index, int count)
+    {
+        int safeIndex = Math.max(index, 0);
+        for (int offset = 0; offset < count; offset++)
+        {
+            deleteSingleRow(sheet, safeIndex);
+        }
+    }
+
+    private void deleteSingleRow(Sheet sheet, int rowIndex)
+    {
+        int lastRowIndex = Math.max(sheet.getLastRowNum(), resolveLastActiveRowIndex(sheet));
+        if (rowIndex > lastRowIndex)
+        {
+            return;
+        }
+        Row row = sheet.getRow(rowIndex);
+        if (row != null)
+        {
+            sheet.removeRow(row);
+        }
+        if (rowIndex < lastRowIndex)
+        {
+            sheet.shiftRows(rowIndex + 1, lastRowIndex, -1, true, false);
+        }
+    }
+
+    private void applyColumnStructure(Workbook workbook, WorkbookStructurePatch patch)
+    {
+        if (StringUtils.isEmpty(patch.getSheetName()) || patch.getIndex() == null)
+        {
+            return;
+        }
+        Sheet sheet = workbook.getSheet(patch.getSheetName());
+        if (sheet == null)
+        {
+            return;
+        }
+        int count = Math.max(patch.getCount() == null ? 1 : patch.getCount().intValue(), 1);
+        int index = Math.max(patch.getIndex().intValue(), 0);
+        String action = patch.getAction().trim().toLowerCase(Locale.ROOT);
+        if ("insert".equals(action))
+        {
+            insertColumns(sheet, index, count);
+            return;
+        }
+        if ("delete".equals(action))
+        {
+            deleteColumns(sheet, index, count);
+        }
+    }
+
+    private void insertColumns(Sheet sheet, int index, int count)
+    {
+        int maxColumnCount = resolveMaxColumnCount(sheet);
+        int safeIndex = Math.max(0, Math.min(index, maxColumnCount));
+        int lastColumnIndex = Math.max(maxColumnCount - 1, safeIndex - 1);
+        int lastRowIndex = resolveLastActiveRowIndex(sheet);
+        for (int rowIndex = 0; rowIndex <= lastRowIndex; rowIndex++)
+        {
+            Row row = sheet.getRow(rowIndex);
+            if (row == null)
+            {
+                continue;
+            }
+            for (int columnIndex = lastColumnIndex; columnIndex >= safeIndex; columnIndex--)
+            {
+                Cell source = row.getCell(columnIndex, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+                Cell target = row.getCell(columnIndex + count, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                if (source == null)
+                {
+                    target.setBlank();
+                    continue;
+                }
+                copyCellValue(source, target);
+                row.removeCell(source);
+            }
+            for (int offset = 0; offset < count; offset++)
+            {
+                Cell inserted = row.getCell(safeIndex + offset, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                inserted.setBlank();
+            }
+        }
+        for (int columnIndex = lastColumnIndex; columnIndex >= safeIndex; columnIndex--)
+        {
+            sheet.setColumnWidth(columnIndex + count, sheet.getColumnWidth(columnIndex));
+        }
+        int templateColumn = safeIndex > 0 ? safeIndex - 1 : safeIndex + count;
+        int templateWidth = templateColumn >= 0 ? sheet.getColumnWidth(templateColumn) : sheet.getDefaultColumnWidth() * 256;
+        for (int offset = 0; offset < count; offset++)
+        {
+            sheet.setColumnWidth(safeIndex + offset, templateWidth);
+        }
+        shiftMergedRegionsForColumnInsert(sheet, safeIndex, count);
+    }
+
+    private void deleteColumns(Sheet sheet, int index, int count)
+    {
+        int maxColumnCount = resolveMaxColumnCount(sheet);
+        if (maxColumnCount <= 0)
+        {
+            return;
+        }
+        int safeIndex = Math.max(0, Math.min(index, maxColumnCount - 1));
+        int safeCount = Math.min(Math.max(count, 1), maxColumnCount - safeIndex);
+        int lastColumnIndex = maxColumnCount - 1;
+        int lastRowIndex = resolveLastActiveRowIndex(sheet);
+        for (int rowIndex = 0; rowIndex <= lastRowIndex; rowIndex++)
+        {
+            Row row = sheet.getRow(rowIndex);
+            if (row == null)
+            {
+                continue;
+            }
+            for (int columnIndex = safeIndex; columnIndex <= lastColumnIndex - safeCount; columnIndex++)
+            {
+                Cell source = row.getCell(columnIndex + safeCount, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+                Cell target = row.getCell(columnIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                if (source == null)
+                {
+                    target.setBlank();
+                    continue;
+                }
+                copyCellValue(source, target);
+            }
+            for (int columnIndex = lastColumnIndex - safeCount + 1; columnIndex <= lastColumnIndex; columnIndex++)
+            {
+                Cell target = row.getCell(columnIndex, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+                if (target != null)
+                {
+                    row.removeCell(target);
+                }
+            }
+        }
+        for (int columnIndex = safeIndex; columnIndex <= lastColumnIndex - safeCount; columnIndex++)
+        {
+            sheet.setColumnWidth(columnIndex, sheet.getColumnWidth(columnIndex + safeCount));
+        }
+        shiftMergedRegionsForColumnDelete(sheet, safeIndex, safeCount);
+    }
+
+    private void copyCellValue(Cell source, Cell target)
+    {
+        target.setCellStyle(source.getCellStyle());
+        switch (source.getCellType())
+        {
+            case STRING:
+                target.setCellValue(source.getStringCellValue());
+                break;
+            case NUMERIC:
+                target.setCellValue(source.getNumericCellValue());
+                break;
+            case BOOLEAN:
+                target.setCellValue(source.getBooleanCellValue());
+                break;
+            case FORMULA:
+                target.setCellFormula(source.getCellFormula());
+                break;
+            case ERROR:
+                target.setCellErrorValue(source.getErrorCellValue());
+                break;
+            case BLANK:
+            default:
+                target.setBlank();
+                break;
+        }
+    }
+
+    private void shiftMergedRegionsForColumnInsert(Sheet sheet, int index, int count)
+    {
+        List<CellRangeAddress> nextRegions = new ArrayList<CellRangeAddress>();
+        for (int regionIndex = 0; regionIndex < sheet.getNumMergedRegions(); regionIndex++)
+        {
+            CellRangeAddress region = sheet.getMergedRegion(regionIndex);
+            int firstColumn = region.getFirstColumn();
+            int lastColumn = region.getLastColumn();
+            if (firstColumn >= index)
+            {
+                firstColumn += count;
+                lastColumn += count;
+            }
+            else if (lastColumn >= index)
+            {
+                lastColumn += count;
+            }
+            nextRegions.add(new CellRangeAddress(region.getFirstRow(), region.getLastRow(), firstColumn, lastColumn));
+        }
+        clearMergedRegions(sheet);
+        for (CellRangeAddress region : nextRegions)
+        {
+            sheet.addMergedRegion(region);
+        }
+    }
+
+    private void shiftMergedRegionsForColumnDelete(Sheet sheet, int index, int count)
+    {
+        List<CellRangeAddress> nextRegions = new ArrayList<CellRangeAddress>();
+        int deleteEnd = index + count - 1;
+        for (int regionIndex = 0; regionIndex < sheet.getNumMergedRegions(); regionIndex++)
+        {
+            CellRangeAddress region = sheet.getMergedRegion(regionIndex);
+            int firstColumn = region.getFirstColumn();
+            int lastColumn = region.getLastColumn();
+            if (lastColumn < index)
+            {
+                nextRegions.add(region.copy());
+                continue;
+            }
+            if (firstColumn > deleteEnd)
+            {
+                nextRegions.add(new CellRangeAddress(region.getFirstRow(), region.getLastRow(), firstColumn - count,
+                        lastColumn - count));
+                continue;
+            }
+            if (firstColumn < index && lastColumn > deleteEnd)
+            {
+                nextRegions.add(new CellRangeAddress(region.getFirstRow(), region.getLastRow(), firstColumn,
+                        lastColumn - count));
+                continue;
+            }
+            if (firstColumn < index && lastColumn >= index && lastColumn <= deleteEnd)
+            {
+                if (index - 1 >= firstColumn)
+                {
+                    nextRegions.add(new CellRangeAddress(region.getFirstRow(), region.getLastRow(), firstColumn, index - 1));
+                }
+                continue;
+            }
+            if (firstColumn >= index && firstColumn <= deleteEnd && lastColumn > deleteEnd)
+            {
+                int nextFirst = index;
+                int nextLast = lastColumn - count;
+                if (nextLast >= nextFirst)
+                {
+                    nextRegions.add(new CellRangeAddress(region.getFirstRow(), region.getLastRow(), nextFirst, nextLast));
+                }
+            }
+        }
+        clearMergedRegions(sheet);
+        for (CellRangeAddress region : nextRegions)
+        {
+            sheet.addMergedRegion(region);
+        }
     }
 
     private void applyWorkbookMergeLayout(Workbook workbook, List<MergeRegionPatch> mergeRegions)
@@ -1088,6 +1534,7 @@ public class ExcelEditorController
 
         Cell cell = row.getCell(columnIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
         applyCellValue(cell, change.getValue());
+        applyCellStylePatch(workbook, cell, change.getStyle());
     }
 
     private void applyCellValue(Cell cell, String inputValue)
@@ -1147,6 +1594,296 @@ public class ExcelEditorController
         }
 
         cell.setCellValue(safeValue);
+    }
+
+    private void applyCellStylePatch(Workbook workbook, Cell cell, Map<String, Object> stylePatch)
+    {
+        if (workbook == null || cell == null || stylePatch == null || stylePatch.isEmpty())
+        {
+            return;
+        }
+
+        CellStyle currentStyle = cell.getCellStyle();
+        CellStyle nextStyle = workbook.createCellStyle();
+        if (currentStyle != null)
+        {
+            nextStyle.cloneStyleFrom(currentStyle);
+        }
+
+        if (stylePatch.containsKey("textAlign"))
+        {
+            applyHorizontalAlignment(nextStyle, asStyleValue(stylePatch.get("textAlign")));
+        }
+        if (stylePatch.containsKey("verticalAlign"))
+        {
+            applyVerticalAlignment(nextStyle, asStyleValue(stylePatch.get("verticalAlign")));
+        }
+        if (stylePatch.containsKey("whiteSpace"))
+        {
+            nextStyle.setWrapText("pre-wrap".equalsIgnoreCase(asStyleValue(stylePatch.get("whiteSpace"))));
+        }
+        if (stylePatch.containsKey("backgroundColor"))
+        {
+            applyFillColorPatch(workbook, nextStyle, asStyleValue(stylePatch.get("backgroundColor")));
+        }
+
+        applyFontStylePatch(workbook, currentStyle, nextStyle, stylePatch);
+        cell.setCellStyle(nextStyle);
+    }
+
+    private void applyHorizontalAlignment(CellStyle style, String alignText)
+    {
+        if (style == null)
+        {
+            return;
+        }
+        String align = StringUtils.trimToEmpty(alignText).toLowerCase(Locale.ROOT);
+        switch (align)
+        {
+            case "center":
+                style.setAlignment(HorizontalAlignment.CENTER);
+                return;
+            case "right":
+                style.setAlignment(HorizontalAlignment.RIGHT);
+                return;
+            case "justify":
+                style.setAlignment(HorizontalAlignment.JUSTIFY);
+                return;
+            case "left":
+            case "":
+            default:
+                style.setAlignment(HorizontalAlignment.LEFT);
+        }
+    }
+
+    private void applyVerticalAlignment(CellStyle style, String alignText)
+    {
+        if (style == null)
+        {
+            return;
+        }
+        String align = StringUtils.trimToEmpty(alignText).toLowerCase(Locale.ROOT);
+        switch (align)
+        {
+            case "middle":
+                style.setVerticalAlignment(VerticalAlignment.CENTER);
+                return;
+            case "bottom":
+                style.setVerticalAlignment(VerticalAlignment.BOTTOM);
+                return;
+            case "top":
+            case "":
+            default:
+                style.setVerticalAlignment(VerticalAlignment.TOP);
+        }
+    }
+
+    private void applyFillColorPatch(Workbook workbook, CellStyle style, String colorText)
+    {
+        if (workbook == null || style == null)
+        {
+            return;
+        }
+        String value = StringUtils.trimToEmpty(colorText);
+        if (StringUtils.isEmpty(value))
+        {
+            style.setFillPattern(FillPatternType.NO_FILL);
+            style.setFillForegroundColor(IndexedColors.AUTOMATIC.getIndex());
+            return;
+        }
+
+        int[] rgb = parseHexColor(value);
+        if (rgb == null)
+        {
+            return;
+        }
+
+        style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        if (style instanceof XSSFCellStyle)
+        {
+            XSSFCellStyle xssfStyle = (XSSFCellStyle) style;
+            xssfStyle.setFillForegroundColor(new XSSFColor(new java.awt.Color(rgb[0], rgb[1], rgb[2]),
+                    new DefaultIndexedColorMap()));
+            return;
+        }
+        if (workbook instanceof HSSFWorkbook)
+        {
+            HSSFPalette palette = ((HSSFWorkbook) workbook).getCustomPalette();
+            HSSFColor targetColor = palette.findSimilarColor(rgb[0], rgb[1], rgb[2]);
+            if (targetColor != null)
+            {
+                style.setFillForegroundColor(targetColor.getIndex());
+            }
+        }
+    }
+
+    private void applyFontStylePatch(Workbook workbook, CellStyle baseStyle, CellStyle targetStyle,
+            Map<String, Object> stylePatch)
+    {
+        if (workbook == null || targetStyle == null || stylePatch == null)
+        {
+            return;
+        }
+
+        boolean containsFontPatch = stylePatch.containsKey("color") || stylePatch.containsKey("fontWeight")
+                || stylePatch.containsKey("fontStyle") || stylePatch.containsKey("textDecoration")
+                || stylePatch.containsKey("fontSize") || stylePatch.containsKey("fontFamily");
+        if (!containsFontPatch)
+        {
+            return;
+        }
+
+        Font sourceFont = resolveFontByCellStyle(workbook, baseStyle);
+        Font nextFont = workbook.createFont();
+        if (sourceFont != null)
+        {
+            copyFontAttributes(sourceFont, nextFont);
+        }
+
+        if (stylePatch.containsKey("fontWeight"))
+        {
+            String fontWeight = asStyleValue(stylePatch.get("fontWeight"));
+            nextFont.setBold("700".equals(fontWeight) || "bold".equalsIgnoreCase(fontWeight));
+        }
+        if (stylePatch.containsKey("fontStyle"))
+        {
+            String fontStyle = asStyleValue(stylePatch.get("fontStyle"));
+            nextFont.setItalic("italic".equalsIgnoreCase(fontStyle));
+        }
+        if (stylePatch.containsKey("textDecoration"))
+        {
+            String decoration = asStyleValue(stylePatch.get("textDecoration"));
+            nextFont.setUnderline("underline".equalsIgnoreCase(decoration) ? Font.U_SINGLE : Font.U_NONE);
+        }
+        if (stylePatch.containsKey("fontFamily"))
+        {
+            String fontFamily = asStyleValue(stylePatch.get("fontFamily"));
+            if (StringUtils.isNotEmpty(fontFamily))
+            {
+                nextFont.setFontName(fontFamily);
+            }
+        }
+        if (stylePatch.containsKey("fontSize"))
+        {
+            Short fontSizePoints = parseFontSizePoints(asStyleValue(stylePatch.get("fontSize")));
+            if (fontSizePoints != null)
+            {
+                nextFont.setFontHeightInPoints(fontSizePoints.shortValue());
+            }
+        }
+        if (stylePatch.containsKey("color"))
+        {
+            applyFontColorPatch(workbook, nextFont, asStyleValue(stylePatch.get("color")));
+        }
+
+        targetStyle.setFont(nextFont);
+    }
+
+    private Font resolveFontByCellStyle(Workbook workbook, CellStyle style)
+    {
+        if (workbook == null || style == null)
+        {
+            return null;
+        }
+        try
+        {
+            return workbook.getFontAt(style.getFontIndexAsInt());
+        }
+        catch (Exception e)
+        {
+            return null;
+        }
+    }
+
+    private void copyFontAttributes(Font source, Font target)
+    {
+        if (source == null || target == null)
+        {
+            return;
+        }
+        target.setBold(source.getBold());
+        target.setItalic(source.getItalic());
+        target.setUnderline(source.getUnderline());
+        target.setStrikeout(source.getStrikeout());
+        target.setColor(source.getColor());
+        target.setFontHeight(source.getFontHeight());
+        target.setFontName(source.getFontName());
+        target.setTypeOffset(source.getTypeOffset());
+        target.setCharSet(source.getCharSet());
+    }
+
+    private void applyFontColorPatch(Workbook workbook, Font font, String colorText)
+    {
+        if (workbook == null || font == null)
+        {
+            return;
+        }
+        String value = StringUtils.trimToEmpty(colorText);
+        if (StringUtils.isEmpty(value))
+        {
+            font.setColor(Font.COLOR_NORMAL);
+            return;
+        }
+
+        int[] rgb = parseHexColor(value);
+        if (rgb == null)
+        {
+            return;
+        }
+        if (font instanceof XSSFFont)
+        {
+            ((XSSFFont) font).setColor(new XSSFColor(new java.awt.Color(rgb[0], rgb[1], rgb[2]),
+                    new DefaultIndexedColorMap()));
+            return;
+        }
+        if (font instanceof HSSFFont && workbook instanceof HSSFWorkbook)
+        {
+            HSSFPalette palette = ((HSSFWorkbook) workbook).getCustomPalette();
+            HSSFColor targetColor = palette.findSimilarColor(rgb[0], rgb[1], rgb[2]);
+            if (targetColor != null)
+            {
+                ((HSSFFont) font).setColor(targetColor.getIndex());
+            }
+        }
+    }
+
+    private String asStyleValue(Object value)
+    {
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private Short parseFontSizePoints(String text)
+    {
+        String value = StringUtils.trimToEmpty(text);
+        Matcher matcher = Pattern.compile("^(\\d+(?:\\.\\d+)?)\\s*pt$", Pattern.CASE_INSENSITIVE).matcher(value);
+        if (!matcher.matches())
+        {
+            return null;
+        }
+        double fontSize = Double.parseDouble(matcher.group(1));
+        if (fontSize < 6 || fontSize > 72)
+        {
+            return null;
+        }
+        return Short.valueOf((short) Math.round(fontSize));
+    }
+
+    private int[] parseHexColor(String text)
+    {
+        String value = StringUtils.trimToEmpty(text);
+        Matcher matcher = Pattern.compile("^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$").matcher(value);
+        if (!matcher.matches())
+        {
+            return null;
+        }
+        String hex = matcher.group(1);
+        if (hex.length() == 3)
+        {
+            hex = new StringBuilder().append(hex.charAt(0)).append(hex.charAt(0)).append(hex.charAt(1))
+                    .append(hex.charAt(1)).append(hex.charAt(2)).append(hex.charAt(2)).toString();
+        }
+        int rgb = Integer.parseInt(hex, 16);
+        return new int[] { (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF };
     }
 
     private Date tryParseDateValue(String inputValue)
@@ -2334,6 +3071,8 @@ public class ExcelEditorController
 
         private List<ColumnWidthPatch> columnWidths;
 
+        private List<WorkbookStructurePatch> structures;
+
         public String getFileName()
         {
             return fileName;
@@ -2393,6 +3132,16 @@ public class ExcelEditorController
         {
             this.columnWidths = columnWidths;
         }
+
+        public List<WorkbookStructurePatch> getStructures()
+        {
+            return structures;
+        }
+
+        public void setStructures(List<WorkbookStructurePatch> structures)
+        {
+            this.structures = structures;
+        }
     }
 
     public static class CellPatch
@@ -2404,6 +3153,8 @@ public class ExcelEditorController
         private Integer colIndex;
 
         private String value;
+
+        private Map<String, Object> style;
 
         public String getSheetName()
         {
@@ -2443,6 +3194,16 @@ public class ExcelEditorController
         public void setValue(String value)
         {
             this.value = value;
+        }
+
+        public Map<String, Object> getStyle()
+        {
+            return style;
+        }
+
+        public void setStyle(Map<String, Object> style)
+        {
+            this.style = style;
         }
     }
 
@@ -2584,6 +3345,93 @@ public class ExcelEditorController
         public void setWidthPx(Integer widthPx)
         {
             this.widthPx = widthPx;
+        }
+    }
+
+    public static class WorkbookStructurePatch
+    {
+        private String type;
+
+        private String action;
+
+        private String sheetName;
+
+        private String targetSheetName;
+
+        private Integer index;
+
+        private Integer targetIndex;
+
+        private Integer count;
+
+        public String getType()
+        {
+            return type;
+        }
+
+        public void setType(String type)
+        {
+            this.type = type;
+        }
+
+        public String getAction()
+        {
+            return action;
+        }
+
+        public void setAction(String action)
+        {
+            this.action = action;
+        }
+
+        public String getSheetName()
+        {
+            return sheetName;
+        }
+
+        public void setSheetName(String sheetName)
+        {
+            this.sheetName = sheetName;
+        }
+
+        public String getTargetSheetName()
+        {
+            return targetSheetName;
+        }
+
+        public void setTargetSheetName(String targetSheetName)
+        {
+            this.targetSheetName = targetSheetName;
+        }
+
+        public Integer getIndex()
+        {
+            return index;
+        }
+
+        public void setIndex(Integer index)
+        {
+            this.index = index;
+        }
+
+        public Integer getTargetIndex()
+        {
+            return targetIndex;
+        }
+
+        public void setTargetIndex(Integer targetIndex)
+        {
+            this.targetIndex = targetIndex;
+        }
+
+        public Integer getCount()
+        {
+            return count;
+        }
+
+        public void setCount(Integer count)
+        {
+            this.count = count;
         }
     }
 
